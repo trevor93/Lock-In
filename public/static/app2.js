@@ -1,0 +1,108 @@
+/* WAR ROOM — Campaign / Mind / Debrief / Stats */
+let CAMPAIGN=null, MAXIMS=null, DUE=null, STATS=null, DEBRIEFS=null, REWARDS=null;
+let OPEN_UNIT=null, CARD_IDX=0, CARD_FLIP=false, MIND_MODE='cards';
+
+window.renderExtra = async function(tab){
+  if (tab==='campaign'){ if(!CAMPAIGN) CAMPAIGN=(await axios.get('/api/campaign')).data; shell(viewCampaign()); }
+  else if (tab==='library'){ if(!LIBRARY) await loadLibrary(); shell(viewLibrary()); }
+  else if (tab==='council'){
+    if(!INTEL) INTEL=(await axios.get('/api/intel')).data;
+    if(!HERMES_HIST) HERMES_HIST=(await axios.get('/api/hermes/history')).data;
+    shell(viewCouncil());
+  }
+  else if (tab==='mind'){
+    if(!DUE) DUE=(await axios.get('/api/cards/due?date='+todayStr())).data;
+    if(!MAXIMS) MAXIMS=(await axios.get('/api/maxims')).data;
+    shell(viewMind());
+  }
+  else if (tab==='debrief'){ if(!DEBRIEFS) DEBRIEFS=(await axios.get('/api/debriefs')).data; shell(viewDebrief()); }
+  else if (tab==='stats'){ STATS=(await axios.get('/api/stats?date='+todayStr())).data; shell(viewStats()); }
+};
+
+/* ============ CAMPAIGN ============ */
+const UST = {locked:['LOCKED','bg-gray-800 text-gray-500'],active:['ACTIVE','bg-gold/20 text-gold'],reading_done:['READING OK','bg-sky-950 text-sky-300'],drill_done:['DRILL OK','bg-emerald-950 text-emerald-300'],complete:['CONQUERED','bg-emerald-800 text-emerald-100']};
+
+function viewCampaign(){
+  return header()+
+  '<section id="campaign-section" class="fade-in">'+
+    '<h2 class="font-disp font-bold text-sm tracking-widest text-gray-400 mb-1">THE CAMPAIGN — PROGRESS-LOCKED</h2>'+
+    '<p class="text-[10px] text-gray-500 mb-3">Unit N unlocks when N−1 is conquered. No calendar pressure — you are a deep reader, not a fast one. Depth is the weapon.</p>'+
+    CAMPAIGN.map(p=>
+      '<article class="card p-3 mb-3">'+
+        '<div class="flex items-center justify-between mb-1">'+
+          '<h3 class="font-disp font-bold text-sm '+(p.track==='strategy'?'text-rose-300':'text-indigo-300')+'">'+esc(p.title)+'</h3>'+
+          '<span class="text-[10px] font-bold text-gray-400">'+p.complete+'/'+p.total+'</span>'+
+        '</div>'+
+        '<p class="text-[10px] text-gray-500 mb-2">'+esc(p.subtitle||'')+'</p>'+
+        '<div class="prog mb-2"><div style="width:'+p.progress+'%;background:'+(p.track==='strategy'?'#f43f5e':'#818cf8')+'"></div></div>'+
+        p.units.map(u=>{
+          const st=UST[u.status]||UST.locked;
+          const open=OPEN_UNIT===u.id;
+          const icon=u.status==='locked'?'fa-lock text-gray-600':u.status==='complete'?'fa-flag text-emerald-400':u.is_exam?'fa-shield-halved text-gold':'fa-location-dot text-gold';
+          return '<div class="border-t border-line/50 py-2">'+
+            '<button class="w-full flex items-center gap-2 text-left" onclick="toggleUnit('+u.id+')" '+(u.status==='locked'?'disabled':'')+'>'+
+              '<i class="fas '+icon+' text-xs w-4"></i>'+
+              '<span class="text-xs flex-1 '+(u.status==='locked'?'text-gray-600':'')+' '+(u.status==='complete'?'line-through text-gray-500':'')+'">'+esc(u.title)+'</span>'+
+              '<span class="pill '+st[1]+'">'+st[0]+'</span>'+
+            '</button>'+
+            (open&&u.status!=='locked'?unitDetail(u):'')+
+          '</div>';
+        }).join('')+
+      '</article>').join('')+
+  '</section>';
+}
+
+function unitDetail(u){
+  const ex=u.exam_questions?JSON.parse(u.exam_questions):null;
+  let h='<div class="mt-2 pl-6 fade-in">';
+  if(u.reading) h+='<div class="mb-2"><p class="text-[9px] font-bold tracking-widest text-sky-400"><i class="fas fa-book"></i> READING</p><p class="text-xs text-gray-300">'+esc(u.reading)+'</p></div>';
+  if(u.lesson) h+='<div class="mb-2"><p class="text-[9px] font-bold tracking-widest text-gold"><i class="fas fa-chess-knight"></i> THE LESSON</p><p class="text-xs text-gray-300 leading-relaxed">'+esc(u.lesson)+'</p></div>';
+  if(u.field_drill) h+='<div class="mb-2"><p class="text-[9px] font-bold tracking-widest text-emerald-400"><i class="fas fa-person-running"></i> FIELD DRILL</p><p class="text-xs text-gray-300 leading-relaxed">'+esc(u.field_drill)+'</p></div>';
+  if(u.debrief_prompt) h+='<div class="mb-2"><p class="text-[9px] font-bold tracking-widest text-fuchsia-400"><i class="fas fa-moon"></i> NIGHT DEBRIEF PROMPT</p><p class="text-xs text-gray-300 italic">'+esc(u.debrief_prompt)+'</p></div>';
+  if(u.drill_report) h+='<div class="mb-2 card p-2"><p class="text-[9px] font-bold text-emerald-500">YOUR DRILL REPORT</p><p class="text-[11px] text-gray-400">'+nl2br(u.drill_report)+'</p></div>';
+  if(u.status!=='complete'){ h+= u.is_exam?examForm(u,ex):stepForm(u); }
+  else h+='<p class="text-[10px] text-emerald-400 font-bold"><i class="fas fa-flag"></i> CONQUERED '+(u.completed_at?u.completed_at.slice(0,10):'')+(u.exam_self_score!=null?' · exam '+u.exam_self_score+'/100':'')+'</p>';
+  return h+'</div>';
+}
+
+function stepForm(u){
+  if(u.status==='active') return '<button class="btn w-full p-2.5 bg-sky-900/60 border border-sky-700 text-sky-200 text-xs font-bold" onclick="unitStep('+u.id+',\'reading\')"><i class="fas fa-book mr-1"></i> I FINISHED THE READING (twice, pen in hand)</button>';
+  if(u.status==='reading_done') return '<p class="text-[10px] font-bold text-emerald-400 mb-1">NOW: EXECUTE THE FIELD DRILL, THEN REPORT:</p>'+
+    '<textarea id="drill-report-'+u.id+'" rows="4" placeholder="What did you actually DO? What happened? Be specific — thin reports are rejected by the honesty engine."></textarea>'+
+    '<button class="btn w-full p-2.5 mt-1.5 bg-emerald-900/60 border border-emerald-700 text-emerald-200 text-xs font-bold" onclick="unitStep('+u.id+',\'drill\')"><i class="fas fa-person-running mr-1"></i> FILE DRILL REPORT</button>';
+  if(u.status==='drill_done') return '<textarea id="debrief-ans-'+u.id+'" rows="2" placeholder="(Optional) Answer the debrief prompt above in 1-3 sentences"></textarea>'+
+    '<button class="btn w-full p-2.5 mt-1.5 bg-gold/20 border border-gold/50 text-gold text-xs font-bold" onclick="unitStep('+u.id+',\'complete\')"><i class="fas fa-flag mr-1"></i> CONQUER UNIT → UNLOCK NEXT</button>';
+  return '';
+}
+
+function examForm(u,qs){
+  return '<div class="card p-3 border-gold/40">'+
+    '<p class="text-[10px] font-bold tracking-widest text-gold mb-2"><i class="fas fa-shield-halved"></i> INTEGRATION EXAM — write from memory FIRST, then verify. Pass: 70/100 self-graded, brutally.</p>'+
+    qs.map((q,i)=>'<div class="mb-2"><p class="text-[11px] text-gray-300 font-semibold mb-1">Q'+(i+1)+'. '+esc(q)+'</p><textarea id="exam-'+u.id+'-'+i+'" rows="3" placeholder="Your answer..."></textarea></div>').join('')+
+    '<label class="text-[11px] text-gray-400 font-semibold">Brutal self-score (0-100): fluff = fail</label>'+
+    '<input type="number" id="exam-score-'+u.id+'" min="0" max="100" placeholder="e.g. 75">'+
+    '<button class="btn w-full p-2.5 mt-2 bg-gold/20 border border-gold/50 text-gold text-xs font-bold" onclick="submitExam('+u.id+','+qs.length+')"><i class="fas fa-gavel mr-1"></i> SUBMIT EXAM FOR JUDGMENT</button>'+
+  '</div>';
+}
+
+function toggleUnit(id){ OPEN_UNIT=OPEN_UNIT===id?null:id; render(); }
+
+async function unitStep(id, step){
+  const payload={step:step,date:todayStr()};
+  if(step==='drill') payload.drill_report=($('#drill-report-'+id)||{}).value||'';
+  if(step==='complete'){ const el=$('#debrief-ans-'+id); if(el) payload.debrief_answer=el.value; }
+  await api('post','/api/units/'+id+'/step',payload);
+  toast(step==='complete'?'UNIT CONQUERED. Next front unlocked. +50':step==='drill'?'Drill report filed. +30 pts.':'Reading logged. +20 pts. Now: the field drill.');
+  CAMPAIGN=(await axios.get('/api/campaign')).data; await loadState(); render();
+}
+
+async function submitExam(id, n){
+  const answers=[]; for(let i=0;i<n;i++) answers.push(($('#exam-'+id+'-'+i)||{}).value||'');
+  if(answers.some(a=>a.trim().length<10)){ toast('Empty or one-line answers detected. This exam deserves real effort — the gate stays closed.', true); return; }
+  const score=Number(($('#exam-score-'+id)||{}).value||0);
+  const r=await api('post','/api/units/'+id+'/step',{step:'complete',exam_answers:answers,exam_self_score:score,date:todayStr()});
+  if(r.failed){ toast(r.message,true); } else { toast('EXAM PASSED. Phase gate opened. +100 pts.'); }
+  CAMPAIGN=(await axios.get('/api/campaign')).data; await loadState(); render();
+}
+
+window.toggleUnit=toggleUnit; window.unitStep=unitStep; window.submitExam=submitExam;
