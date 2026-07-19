@@ -459,7 +459,41 @@ app.get('/api/stats', async (c) => {
   ).all()).results
   const streak = await computeStreak(DB, date)
   const pts = await DB.prepare(`SELECT COALESCE(SUM(points),0) as total FROM points_ledger`).first<{ total: number }>()
-  return c.json({ days, categories: catRows, ledger, unitStats, cardStats, flagCounts, streak, points: pts?.total ?? 0 })
+
+  // ── MEDALS (war decorations, computed live — earned, never given) ──
+  const debriefCount = (await DB.prepare(`SELECT COUNT(*) as n FROM debriefs`).first<any>())?.n ?? 0
+  const chaptersDone = (await DB.prepare(`SELECT COUNT(*) as n FROM book_progress WHERE status='done'`).first<any>())?.n ?? 0
+  const booksDone = (await DB.prepare(
+    `SELECT COUNT(*) as n FROM (SELECT book_id, COUNT(*) c FROM book_progress WHERE status='done' GROUP BY book_id HAVING c >= 12)`
+  ).first<any>())?.n ?? 0
+  const intelCount = (await DB.prepare(`SELECT COUNT(*) as n FROM intel_entries`).first<any>())?.n ?? 0
+  const examsPassed = (await DB.prepare(`SELECT COUNT(*) as n FROM unit_progress up JOIN units u ON u.id=up.unit_id WHERE u.is_exam=1 AND up.status='complete'`).first<any>())?.n ?? 0
+  const earlyWakes = (await DB.prepare(
+    `SELECT COUNT(*) as n FROM debriefs WHERE wake_time IS NOT NULL AND wake_time <= '06:00'`
+  ).first<any>())?.n ?? 0
+  const victoryDays = days.filter(d => d.pct >= 80 && d.debrief).length
+  const reviews = cardStats?.reviews ?? 0
+  const unitsWon = unitStats?.complete ?? 0
+  const totalFlags = (flagCounts as any[]).reduce((a: number, f: any) => a + f.n, 0)
+  const medals = [
+    { id: 'first_blood',   icon: 'fa-droplet',        title: 'FIRST BLOOD',        desc: 'Complete your first block',            earned: (pts?.total ?? 0) !== 0 || debriefCount > 0 || unitsWon > 0 },
+    { id: 'scribe',        icon: 'fa-feather-pointed', title: 'THE SCRIBE',        desc: 'File 7 night debriefs',                earned: debriefCount >= 7,  prog: Math.min(debriefCount, 7),  goal: 7 },
+    { id: 'chronicler',    icon: 'fa-scroll',          title: 'CHRONICLER',        desc: 'File 30 night debriefs',               earned: debriefCount >= 30, prog: Math.min(debriefCount, 30), goal: 30 },
+    { id: 'week_of_iron',  icon: 'fa-fire',            title: 'WEEK OF IRON',      desc: '7-day victory streak',                 earned: streak >= 7,  prog: Math.min(streak, 7),  goal: 7 },
+    { id: 'month_of_steel',icon: 'fa-fire-flame-curved',title:'MONTH OF STEEL',    desc: '30-day victory streak',                earned: streak >= 30, prog: Math.min(streak, 30), goal: 30 },
+    { id: 'dawn_raider',   icon: 'fa-sun',             title: 'DAWN RAIDER',       desc: 'Wake by 06:00 ten times',              earned: earlyWakes >= 10, prog: Math.min(earlyWakes, 10), goal: 10 },
+    { id: 'first_conquest',icon: 'fa-flag',            title: 'FIRST CONQUEST',    desc: 'Conquer your first campaign unit',     earned: unitsWon >= 1 },
+    { id: 'strategist',    icon: 'fa-chess-knight',    title: 'STRATEGIST',        desc: 'Conquer 10 campaign units',            earned: unitsWon >= 10, prog: Math.min(unitsWon, 10), goal: 10 },
+    { id: 'gatekeeper',    icon: 'fa-shield-halved',   title: 'GATEKEEPER',        desc: 'Pass an integration exam',             earned: examsPassed >= 1 },
+    { id: 'bookworm',      icon: 'fa-book-open',       title: 'DEEP READER',       desc: 'Conquer 25 real chapters',             earned: chaptersDone >= 25, prog: Math.min(chaptersDone, 25), goal: 25 },
+    { id: 'librarian',     icon: 'fa-crown',           title: 'MASTER OF TEXTS',   desc: 'Finish a complete book',               earned: booksDone >= 1 },
+    { id: 'drillmaster',   icon: 'fa-layer-group',     title: 'DRILLMASTER',       desc: '100 flashcard reviews',                earned: reviews >= 100, prog: Math.min(reviews, 100), goal: 100 },
+    { id: 'spymaster',     icon: 'fa-user-secret',     title: 'SPYMASTER',         desc: 'File 15 life-intel entries',           earned: intelCount >= 15, prog: Math.min(intelCount, 15), goal: 15 },
+    { id: 'clean_record',  icon: 'fa-scale-balanced',  title: 'CLEAN RECORD',      desc: '14 days, zero honesty flags, 5+ victory days', earned: totalFlags === 0 && victoryDays >= 5 },
+    { id: 'sovereign',     icon: 'fa-dragon',          title: 'SOVEREIGN',         desc: 'Reach 10,000 points',                  earned: (pts?.total ?? 0) >= 10000, prog: Math.min(Math.max(pts?.total ?? 0, 0), 10000), goal: 10000 },
+  ]
+
+  return c.json({ days, categories: catRows, ledger, unitStats, cardStats, flagCounts, streak, points: pts?.total ?? 0, medals })
 })
 
 // ============ LIFE INTEL (The Council) ============

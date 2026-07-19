@@ -100,6 +100,26 @@ function viewStats(){
       '<div class="card-glass p-3 text-center"><p class="font-disp font-bold text-xl text-sky-400">'+avgSleep+'h</p><p class="text-[8px] text-gray-500 font-bold tracking-widest">AVG SLEEP</p></div>'+
       '<div class="card-glass p-3 text-center"><p class="font-disp font-bold text-xl text-rose-400">'+(s.unitStats.complete||0)+'/'+(s.unitStats.total||0)+'</p><p class="text-[8px] text-gray-500 font-bold tracking-widest">UNITS WON</p></div>'+
     '</div>'+
+    (s.medals?
+    '<div class="card-lux p-3.5 mb-3">'+
+      '<div class="flex items-center justify-between mb-2">'+
+        '<h3 class="font-engraved font-bold text-xs gold-text"><i class="fas fa-medal mr-1"></i>MEDALS OF THE CAMPAIGN</h3>'+
+        '<span class="pill pill-gold">'+s.medals.filter(m=>m.earned).length+' / '+s.medals.length+'</span>'+
+      '</div>'+
+      '<div class="grid grid-cols-3 gap-2">'+
+        s.medals.map(m=>{
+          const pct = m.goal ? Math.round((m.prog/m.goal)*100) : (m.earned?100:0);
+          return '<div class="text-center p-2 rounded-xl" style="'+(m.earned
+            ?'background:linear-gradient(160deg,rgba(212,175,55,.14),rgba(212,175,55,.03));border:1px solid rgba(212,175,55,.4)'
+            :'background:rgba(15,21,32,.6);border:1px solid var(--line);opacity:.55')+'">'+
+            '<i class="fas '+m.icon+' text-lg mb-1 '+(m.earned?'gold-text':'text-gray-600')+'" '+(m.earned?'style="filter:drop-shadow(0 0 8px rgba(212,175,55,.6))"':'')+'></i>'+
+            '<p class="text-[8px] font-bold tracking-wider '+(m.earned?'text-gold':'text-gray-500')+'">'+m.title+'</p>'+
+            '<p class="text-[7px] text-gray-600 leading-tight mt-0.5">'+m.desc+'</p>'+
+            (m.goal&&!m.earned?'<div class="prog mt-1" style="height:3px"><div style="width:'+pct+'%"></div></div>':'')+
+          '</div>';
+        }).join('')+
+      '</div>'+
+    '</div>':'')+
     '<div class="card p-3 mb-3">'+
       '<h3 class="text-[10px] font-bold tracking-widest text-gray-400 mb-2">LAST 14 DAYS (green = victory day: ≥80% + debrief)</h3>'+
       '<div class="flex items-end gap-1" style="height:70px">'+
