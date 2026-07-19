@@ -164,7 +164,8 @@ app.get('/api/state', async (c) => {
   return c.json({
     date, time, blocks, current, next, adherence: adh, streak,
     points: pts?.total ?? 0, todayPoints: todayPts?.total ?? 0,
-    flags, debrief, yesterdayTargets: (yDebrief as any)?.tomorrow_targets || null,
+    flags, debrief, debriefDoneToday: !!debrief,
+    yesterdayTargets: (yDebrief as any)?.tomorrow_targets || null,
     dueCards: dueCards?.n ?? 0, activeUnits
   })
 })
@@ -493,17 +494,17 @@ app.post('/api/intel/:id/verdict', async (c) => {
 
 // ============ BOOK PROGRESS (real books library) ============
 const BOOKS_META = [
-  { id: 'art_of_war', title: 'The Art of War', author: 'Sun Tzu', phase: 'P1' },
-  { id: 'the_prince', title: 'The Prince', author: 'Machiavelli', phase: 'P2' },
-  { id: 'discourses', title: 'Discourses on Livy', author: 'Machiavelli', phase: 'P2B' },
-  { id: 'on_war', title: 'On War (Book I)', author: 'Clausewitz', phase: 'P3' },
-  { id: 'meditations', title: 'Meditations', author: 'Marcus Aurelius', phase: 'PHIL' },
-  { id: 'enchiridion', title: 'The Enchiridion', author: 'Epictetus', phase: 'PHIL' },
-  { id: 'apology', title: 'Apology', author: 'Plato', phase: 'PHIL' },
-  { id: 'crito', title: 'Crito', author: 'Plato', phase: 'PHIL' },
-  { id: 'republic', title: 'The Republic (I–IV)', author: 'Plato', phase: 'PHIL' },
-  { id: 'zarathustra', title: 'Thus Spake Zarathustra (Pt.1)', author: 'Nietzsche', phase: 'PHIL' },
-  { id: 'beyond_good_evil', title: 'Beyond Good and Evil', author: 'Nietzsche', phase: 'PHIL' },
+  { id: 'art_of_war', title: 'The Art of War', author: 'Sun Tzu', phase: 'P1', chapters: 13 },
+  { id: 'the_prince', title: 'The Prince', author: 'Machiavelli', phase: 'P2', chapters: 26 },
+  { id: 'discourses', title: 'Discourses on Livy', author: 'Machiavelli', phase: 'P2B', chapters: 141 },
+  { id: 'on_war', title: 'On War (Book I)', author: 'Clausewitz', phase: 'P3', chapters: 12 },
+  { id: 'meditations', title: 'Meditations', author: 'Marcus Aurelius', phase: 'PHIL', chapters: 12 },
+  { id: 'enchiridion', title: 'The Enchiridion', author: 'Epictetus', phase: 'PHIL', chapters: 6 },
+  { id: 'apology', title: 'Apology', author: 'Plato', phase: 'PHIL', chapters: 4 },
+  { id: 'crito', title: 'Crito', author: 'Plato', phase: 'PHIL', chapters: 3 },
+  { id: 'republic', title: 'The Republic (I–IV)', author: 'Plato', phase: 'PHIL', chapters: 4 },
+  { id: 'zarathustra', title: 'Thus Spake Zarathustra (Pt.1)', author: 'Nietzsche', phase: 'PHIL', chapters: 25 },
+  { id: 'beyond_good_evil', title: 'Beyond Good and Evil', author: 'Nietzsche', phase: 'PHIL', chapters: 10 },
 ]
 
 app.get('/api/library', async (c) => {
@@ -893,13 +894,21 @@ app.get('/', (c) => c.html(`<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Cinzel:wght@500;600;700&display=swap" rel="stylesheet">
 <link href="/static/style.css" rel="stylesheet">
 <script>tailwind.config={theme:{extend:{fontFamily:{disp:['Rajdhani','sans-serif'],body:['Inter','sans-serif']},colors:{ink:'#0a0e14',panel:'#111826',line:'#1e2a3d',gold:'#d4af37',blood:'#dc2626',jade:'#22c55e'}}}}</script>
 </head>
-<body class="bg-ink text-gray-200 font-body">
-<div id="app"><div class="flex items-center justify-center h-screen text-gold font-disp text-xl tracking-widest">⚔ ENTERING THE WAR ROOM…</div></div>
+<body class="text-gray-200 font-body">
+<div class="splash" id="splash">
+  <div class="splash-sword">⚔</div>
+  <div class="font-engraved gold-text text-2xl font-bold">WAR ROOM</div>
+  <div class="splash-line"></div>
+  <div class="text-[10px] tracking-[.35em] text-gray-500 font-semibold">DISCIPLINE · STRATEGY · HONESTY</div>
+</div>
+<canvas id="fx-canvas"></canvas>
+<div id="app"></div>
 <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
+<script src="/static/fx.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/app2.js"></script>
 <script src="/static/app3.js"></script>

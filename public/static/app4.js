@@ -1,11 +1,17 @@
 /* WAR ROOM — Debrief + Stats */
 function viewDebrief(){
   const d=STATE.debrief||{};
+  const filed = !!STATE.debriefDoneToday;
   return header()+
-  '<section id="debrief-section" class="fade-in">'+
-    '<h2 class="font-disp font-bold text-sm tracking-widest text-gray-400 mb-1"><i class="fas fa-pen-nib text-fuchsia-400"></i> NIGHT DEBRIEF — '+todayStr()+'</h2>'+
-    '<p class="text-[10px] text-gray-500 mb-3">The single highest-leverage habit in this system. 10 minutes. Marcus Aurelius did this 1,900 years ago. Missing it triggers the honesty engine.</p>'+
-    '<div class="card p-3 mb-3">'+
+  '<section id="debrief-section" class="stagger">'+
+    '<div class="card-lux p-3.5 mb-3 flex items-center gap-3">'+
+      '<i class="fas '+(filed?'fa-file-shield text-jade':'fa-pen-nib text-fuchsia-400')+' text-2xl" style="filter:drop-shadow(0 0 10px currentColor)"></i>'+
+      '<div class="flex-1">'+
+        '<h2 class="font-engraved font-bold text-sm '+(filed?'text-jade':'gold-text')+'">NIGHT DEBRIEF — '+todayStr()+'</h2>'+
+        '<p class="text-[10px] text-gray-500 leading-relaxed mt-0.5">'+(filed?'Filed. You can still amend it before midnight.':'The single highest-leverage habit in this system. 10 minutes. Marcus Aurelius did this 1,900 years ago. Missing it triggers the honesty engine.')+'</p>'+
+      '</div>'+
+    '</div>'+
+    '<div class="card p-3.5 mb-3">'+
       '<label class="text-[10px] font-bold tracking-widest text-emerald-400">WHAT DID I WIN TODAY?</label>'+
       '<textarea id="db-wins" rows="2" class="mb-2">'+esc(d.wins||'')+'</textarea>'+
       '<label class="text-[10px] font-bold tracking-widest text-red-400">WHERE DID I BREAK THE SCHEDULE — AND WHY, HONESTLY?</label>'+
@@ -23,10 +29,10 @@ function viewDebrief(){
         '<div><label class="text-[10px] font-bold text-gray-400">LIGHTS OUT</label><input type="time" id="db-sleep" value="'+(d.sleep_time||'')+'"></div>'+
         '<div><label class="text-[10px] font-bold text-gray-400">SLEPT (h)</label><input type="number" step="0.25" id="db-hours" value="'+(d.sleep_hours||'')+'"></div>'+
       '</div>'+
-      '<button class="btn w-full p-3 bg-fuchsia-900/50 border border-fuchsia-700 text-fuchsia-200 text-sm font-bold" onclick="saveDebrief()"><i class="fas fa-file-shield mr-1"></i> FILE INTELLIGENCE REPORT (+25)</button>'+
+      '<button class="btn btn-gold w-full p-3 text-sm" onclick="saveDebrief()"><i class="fas fa-file-shield mr-1"></i> FILE INTELLIGENCE REPORT (+25)</button>'+
     '</div>'+
     rewardsPanel()+
-    '<h3 class="font-disp font-bold text-sm tracking-widest text-gray-400 mt-4 mb-2">PAST REPORTS ('+DEBRIEFS.length+')</h3>'+
+    '<div class="sect">PAST REPORTS — '+DEBRIEFS.length+' FILED</div>'+
     DEBRIEFS.slice(0,14).map(x=>
       '<details class="card p-3 mb-2">'+
         '<summary class="text-xs font-bold cursor-pointer">'+x.log_date+(x.sleep_hours?' · '+x.sleep_hours+'h sleep':'')+(x.mood?' · mood '+x.mood+'/5':'')+'</summary>'+
@@ -54,7 +60,7 @@ function rewardsPanel(){
 
 async function redeem(id){
   await api('post','/api/rewards/'+id+'/redeem',{date:todayStr()});
-  toast('Reward claimed. You paid for it in discipline — enjoy it fully, zero guilt.');
+  FX.confetti({count:80}); FX.toast('REWARD CLAIMED — paid in discipline, enjoy with zero guilt','gold');
   REWARDS=(await axios.get('/api/rewards')).data; await loadState(); render();
 }
 
@@ -65,7 +71,7 @@ async function saveDebrief(){
   if(!b.wins&&!b.breaks&&!b.tomorrow_targets){ toast('An empty report is a lie of omission. Write something true.',true); return; }
   if(!b.tomorrow_targets){ toast('Law 4: tomorrow\'s 3 targets are NOT optional. Decide tonight.',true); return; }
   await api('post','/api/debrief',b);
-  toast('Intelligence report filed. Tomorrow already knows its orders.');
+  FX.success(); FX.toast('INTELLIGENCE REPORT FILED — tomorrow already knows its orders  +25','gold');
   DEBRIEFS=(await axios.get('/api/debriefs')).data; await loadState(); render();
 }
 
@@ -76,12 +82,23 @@ function viewStats(){
   const sleepDays=s.days.filter(d=>d.sleep!=null);
   const avgSleep=sleepDays.length?(sleepDays.reduce((a,d)=>a+d.sleep,0)/sleepDays.length).toFixed(1):'—';
   const catName={morning:'Morning',workout:'Exercise',deepwork:'Deep Work',study:'University',meal:'Meals',strategy:'Strategy',philosophy:'Philosophy',entertainment:'Entertainment',skincare:'Skincare',admin:'Admin',social:'Social',review:'Review',sleep:'Sleep',flex:'Recovery',rest:'Rest'};
+  const rank = FX.rank(STATE.points);
   return header()+
-  '<section id="stats-section" class="fade-in">'+
+  '<section id="stats-section" class="stagger">'+
+    '<div class="card-lux p-4 mb-3 flex items-center gap-4">'+
+      FX.ring(rank.prog, 84, 7, '', '')+
+      '<div class="flex-1">'+
+        '<p class="text-[9px] text-gray-500 font-bold tracking-[.2em]">CURRENT RANK</p>'+
+        '<p class="font-engraved font-bold text-lg gold-text"><i class="fas '+rank.icon+' mr-1"></i>'+rank.name+'</p>'+
+        (rank.next
+          ?'<p class="text-[10px] text-gray-500 mt-0.5">'+(rank.nextAt-Math.max(STATE.points,0))+' pts to <span class="text-gold font-bold">'+rank.next+'</span> · '+rank.prog+'% there</p>'
+          :'<p class="text-[10px] text-gold mt-0.5">MAXIMUM RANK ACHIEVED</p>')+
+      '</div>'+
+    '</div>'+
     '<div class="grid grid-cols-3 gap-2 mb-3">'+
-      '<div class="card p-3 text-center"><p class="font-disp font-bold text-xl '+(avg>=80?'text-jade':avg>=50?'text-amber-400':'text-red-400')+'">'+avg+'%</p><p class="text-[9px] text-gray-500 font-bold">14-DAY ADHERENCE</p></div>'+
-      '<div class="card p-3 text-center"><p class="font-disp font-bold text-xl text-sky-400">'+avgSleep+'h</p><p class="text-[9px] text-gray-500 font-bold">AVG SLEEP</p></div>'+
-      '<div class="card p-3 text-center"><p class="font-disp font-bold text-xl text-rose-400">'+(s.unitStats.complete||0)+'/'+(s.unitStats.total||0)+'</p><p class="text-[9px] text-gray-500 font-bold">UNITS WON</p></div>'+
+      '<div class="card-glass p-3 text-center"><p class="font-disp font-bold text-xl '+(avg>=80?'text-jade':avg>=50?'text-amber-400':'text-red-400')+'" data-countup="'+avg+'">'+avg+'</p><p class="text-[8px] text-gray-500 font-bold tracking-widest">14-DAY ADH %</p></div>'+
+      '<div class="card-glass p-3 text-center"><p class="font-disp font-bold text-xl text-sky-400">'+avgSleep+'h</p><p class="text-[8px] text-gray-500 font-bold tracking-widest">AVG SLEEP</p></div>'+
+      '<div class="card-glass p-3 text-center"><p class="font-disp font-bold text-xl text-rose-400">'+(s.unitStats.complete||0)+'/'+(s.unitStats.total||0)+'</p><p class="text-[8px] text-gray-500 font-bold tracking-widest">UNITS WON</p></div>'+
     '</div>'+
     '<div class="card p-3 mb-3">'+
       '<h3 class="text-[10px] font-bold tracking-widest text-gray-400 mb-2">LAST 14 DAYS (green = victory day: ≥80% + debrief)</h3>'+

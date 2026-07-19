@@ -63,4 +63,5 @@ npm run db:seed                        # seed schedule/laws/rewards
 - **Platform**: Cloudflare Pages (pending — user to choose deploy path)
 - **Tech Stack**: Hono + TypeScript + Cloudflare D1 + Tailwind CDN + vanilla JS + PWA
 - **Status**: ✅ Fully working in sandbox (⚠ in-app Hermes chat requires a valid LLM API key injection)
-- **Last Updated**: 2026-07-11
+- **Design**: Luxury v2 — layered-black glassmorphism, engraved gold (Cinzel), FX engine (confetti, haptics, count-up, progress rings), rank ladder (RECRUIT→SOVEREIGN), streak flame tiers, timeline day view, WhatsApp-grade council chat, premium book reader with drop caps
+- **Last Updated**: 2026-07-15

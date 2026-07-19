@@ -31,18 +31,19 @@ async function api(method, url, data) {
   }
 }
 
-function toast(msg, bad=false) {
-  const t = document.createElement('div');
-  t.className = `fixed top-3 left-3 right-3 z-[100] p-3 rounded-xl text-sm font-semibold fade-in ${bad?'bg-red-950 border border-red-700 text-red-200':'bg-emerald-950 border border-emerald-700 text-emerald-200'}`;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(()=>t.remove(), bad?5000:2500);
-}
+function toast(msg, bad=false) { FX.toast(msg, bad?'bad':'ok'); }
 
 async function loadState() {
   STATE = (await axios.get(`/api/state?date=${todayStr()}&time=${nowTime()}`)).data;
 }
 
+function tabBadge(id) {
+  const s = STATE; if (!s) return 0;
+  if (id==='now')  return s.flags.length;
+  if (id==='mind') return s.dueCards||0;
+  if (id==='debrief') return s.debriefDoneToday ? 0 : (new Date().getHours()>=20 ? 1 : 0);
+  return 0;
+}
 function shell(content) {
   const tabs = [
     ['now','fa-crosshairs','NOW'],
@@ -57,35 +58,46 @@ function shell(content) {
   app().innerHTML = `
     <main class="max-w-lg mx-auto px-3 pt-3 pb-28">${content}</main>
     <nav class="tabbar flex max-w-lg mx-auto" id="main-nav">
-      ${tabs.map(([id,ic,label])=>`
+      ${tabs.map(([id,ic,label])=>{
+        const badge = tabBadge(id);
+        return `
         <button class="tab-btn ${TAB===id?'active':''}" data-tab="${id}">
+          ${badge?`<span class="tab-badge">${badge>9?'9+':badge}</span>`:''}
           <i class="fas ${ic}"></i>${label}
-        </button>`).join('')}
+        </button>`;}).join('')}
     </nav>`;
-  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ TAB=b.dataset.tab; render(); });
+  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ FX.tap(); TAB=b.dataset.tab; render(); window.scrollTo({top:0}); });
+  FX.countUpAll();
 }
 
 function header() {
   const s = STATE;
   const flagCount = s.flags.length;
+  const rank = FX.rank(s.points);
   return `
-  <header class="flex items-center justify-between mb-3">
-    <div>
-      <h1 class="font-disp font-bold text-xl tracking-widest text-gold">⚔ WAR ROOM</h1>
-      <p class="text-[11px] text-gray-500">${new Date().toDateString()}</p>
+  <header class="mb-3">
+    <div class="flex items-center justify-between mb-2.5">
+      <div>
+        <h1 class="font-engraved font-bold text-lg gold-text">⚔ WAR ROOM</h1>
+        <p class="text-[10px] text-gray-500 tracking-wide">${new Date().toDateString()}</p>
+      </div>
+      <div class="text-right">
+        <span class="rank-plate"><i class="fas ${rank.icon}"></i> ${rank.name}</span>
+        ${rank.next?`<div class="text-[8px] text-gray-500 mt-1 font-semibold tracking-wider">${rank.nextAt - Math.max(s.points,0)} PTS → ${rank.next}</div>`:''}
+      </div>
     </div>
-    <div class="flex gap-2 text-center">
-      <div class="card px-2.5 py-1.5">
-        <div class="font-disp font-bold text-base ${s.streak>0?'text-orange-400':'text-gray-500'}"><i class="fas fa-fire text-xs"></i> ${s.streak}</div>
-        <div class="text-[9px] text-gray-500 font-semibold">STREAK</div>
+    <div class="grid grid-cols-3 gap-2 text-center">
+      <div class="card-glass px-2 py-2">
+        <div class="font-disp font-bold text-lg leading-none"><i class="fas fa-fire ${FX.flameClass(s.streak)} text-sm"></i> <span class="text-white" data-countup="${s.streak}">${s.streak}</span></div>
+        <div class="text-[8px] text-gray-500 font-bold tracking-[.18em] mt-1">STREAK</div>
       </div>
-      <div class="card px-2.5 py-1.5">
-        <div class="font-disp font-bold text-base text-gold">${s.points}</div>
-        <div class="text-[9px] text-gray-500 font-semibold">POINTS</div>
+      <div class="card-glass px-2 py-2">
+        <div class="font-disp font-bold text-lg leading-none gold-text" data-countup="${s.points}">${s.points}</div>
+        <div class="text-[8px] text-gray-500 font-bold tracking-[.18em] mt-1">POINTS</div>
       </div>
-      <div class="card px-2.5 py-1.5 ${flagCount?'border-red-800':''}">
-        <div class="font-disp font-bold text-base ${flagCount?'text-red-400':'text-jade'}">${flagCount?flagCount:'✓'}</div>
-        <div class="text-[9px] text-gray-500 font-semibold">FLAGS</div>
+      <div class="card-glass px-2 py-2 ${flagCount?'sev-critical':''}">
+        <div class="font-disp font-bold text-lg leading-none ${flagCount?'text-red-400':'text-jade'}">${flagCount?flagCount:'✓'}</div>
+        <div class="text-[8px] text-gray-500 font-bold tracking-[.18em] mt-1">FLAGS</div>
       </div>
     </div>
   </header>`;
@@ -112,16 +124,23 @@ function statusBtns(b, compact=false) {
   const st = b.log_status;
   const mk = (val, ic, cls, active) => `
     <button class="btn ${compact?'px-2.5 py-1.5 text-[11px]':'px-3 py-2 text-xs'} ${active?cls:'bg-gray-800/60 text-gray-500 border border-line'}"
-      onclick="logBlock(${b.id},'${st===val?'pending':val}')"><i class="fas ${ic}"></i></button>`;
+      onclick="logBlock(${b.id},'${st===val?'pending':val}',event)"><i class="fas ${ic}"></i></button>`;
   return `<div class="flex gap-1.5">
     ${mk('done','fa-check','bg-emerald-700 text-white', st==='done')}
     ${mk('partial','fa-star-half-stroke','bg-amber-600 text-white', st==='partial')}
     ${mk('skipped','fa-xmark','bg-red-800 text-white', st==='skipped')}
   </div>`;
 }
-async function logBlock(id, status){
+async function logBlock(id, status, ev){
+  const el = ev && ev.target ? ev.target.closest('button') : null;
+  const b = (STATE.blocks||[]).find(x=>x.id===id);
   await api('post',`/api/blocks/${id}/log`,{date:todayStr(),status});
+  if (status==='done') { FX.success(); if (b) FX.floatDelta(b.points, el); }
+  else if (status==='skipped') FX.fail();
   await loadState(); render();
+  if (status==='done' && STATE.adherence && STATE.adherence.pct>=100) {
+    FX.confetti({count:130}); FX.toast('FULL DAY CONQUERED — 100% ADHERENCE','gold');
+  }
 }
 
 function viewNow() {
@@ -129,7 +148,7 @@ function viewNow() {
   const adh = s.adherence;
   const adhColor = adh.pct>=80?'#22c55e':adh.pct>=50?'#f59e0b':'#dc2626';
   return `${header()}${flagsPanel()}
-  <section id="now-section" class="fade-in">
+  <section id="now-section" class="stagger">
     ${s.yesterdayTargets?`
     <div class="card p-3 mb-3 border-gold/30">
       <h3 class="text-[10px] font-bold tracking-widest text-gold mb-1"><i class="fas fa-bullseye"></i> TODAY'S 3 TARGETS (set last night — Law 4)</h3>
@@ -140,18 +159,19 @@ function viewNow() {
     </div>`}
 
     ${c?`
-    <article class="card now-ring p-5 mb-3 text-center border-gold/40">
-      <p class="text-[10px] font-bold tracking-[.25em] text-gold mb-1">RIGHT NOW · ${c.start_time}–${c.end_time}</p>
-      <i class="fas ${CAT_ICON[c.category]||'fa-circle'} cat-${c.category} text-2xl mb-2"></i>
-      <h2 class="font-disp font-bold text-2xl leading-tight mb-1">${esc(c.title)}</h2>
+    <article class="card-lux now-ring p-5 mb-3 text-center">
+      <p class="text-[10px] font-bold tracking-[.3em] gold-text mb-1.5">◆ RIGHT NOW · ${c.start_time}–${c.end_time} ◆</p>
+      <div id="block-countdown" class="font-disp text-[11px] text-gray-500 font-bold mb-2"></div>
+      <i class="fas ${CAT_ICON[c.category]||'fa-circle'} cat-${c.category} text-3xl mb-2" style="filter:drop-shadow(0 0 12px currentColor)"></i>
+      <h2 class="font-disp font-bold text-2xl leading-tight mb-1 text-white">${esc(c.title)}</h2>
       <p class="text-xs text-gray-400 leading-relaxed mb-3">${esc(c.description||'')}</p>
-      ${c.is_non_negotiable?'<span class="pill bg-red-950 text-red-400 border border-red-800 mb-3 inline-block">NON-NEGOTIABLE</span>':''}
+      ${c.is_non_negotiable?'<span class="pill pill-blood mb-3 inline-flex"><i class="fas fa-lock text-[8px]"></i>NON-NEGOTIABLE</span>':''}
       <div class="flex justify-center">${statusBtns(c)}</div>
     </article>`:`
-    <article class="card p-5 mb-3 text-center">
-      <i class="fas fa-moon text-2xl text-blue-400 mb-2"></i>
-      <h2 class="font-disp font-bold text-xl">OFF THE CLOCK</h2>
-      <p class="text-xs text-gray-500">No scheduled block right now. If it's late — you should be asleep, soldier.</p>
+    <article class="card-lux p-6 mb-3 text-center">
+      <i class="fas fa-moon text-3xl text-blue-400 mb-2" style="filter:drop-shadow(0 0 14px rgba(96,165,250,.5))"></i>
+      <h2 class="font-disp font-bold text-xl text-white">OFF THE CLOCK</h2>
+      <p class="text-xs text-gray-500 mt-1">No scheduled block right now. If it's late — you should be asleep, soldier.</p>
     </article>`}
 
     ${n?`
@@ -163,13 +183,15 @@ function viewNow() {
       </div>
     </div>`:''}
 
-    <div class="card p-3 mb-3">
-      <div class="flex justify-between items-baseline mb-1.5">
-        <h3 class="text-[10px] font-bold tracking-widest text-gray-400">TODAY'S ADHERENCE (target: 80% — Law 6)</h3>
-        <span class="font-disp font-bold text-lg" style="color:${adhColor}">${adh.pct}%</span>
+    <div class="card-lux p-4 mb-3 flex items-center gap-4">
+      ${FX.ring(adh.pct, 84, 7, adh.pct+'%', 'LAW 6')}
+      <div class="flex-1">
+        <h3 class="text-[10px] font-bold tracking-[.18em] text-gray-400 mb-1">TODAY'S ADHERENCE</h3>
+        <p class="text-xs text-gray-300"><span class="font-disp font-bold text-white">${adh.done}</span> / ${adh.total} blocks held</p>
+        <p class="text-[10px] text-gray-500 mt-1">Target: 80% · today's points
+          <span class="font-disp font-bold ${s.todayPoints>=0?'text-jade':'text-red-400'}">${s.todayPoints>=0?'+':''}${s.todayPoints}</span></p>
+        <div class="prog mt-2"><div style="width:${adh.pct}%"></div></div>
       </div>
-      <div class="prog"><div style="width:${adh.pct}%;background:${adhColor}"></div></div>
-      <p class="text-[10px] text-gray-500 mt-1">${adh.done} / ${adh.total} blocks · today's points: <span class="${s.todayPoints>=0?'text-jade':'text-red-400'}">${s.todayPoints>=0?'+':''}${s.todayPoints}</span></p>
     </div>
 
     ${s.activeUnits.length?`
@@ -193,14 +215,21 @@ function viewNow() {
 /* ================= TODAY TAB ================= */
 let LAWS_CACHE = null;
 function viewToday() {
+  const nowMin = (() => { const [h,m]=nowTime().split(':').map(Number); return h*60+m; })();
   return `${header()}
   <section id="today-schedule" class="fade-in">
-    <h2 class="font-disp font-bold text-sm tracking-widest text-gray-400 mb-2">FULL DAY PLAN — ${dowLabel()}</h2>
+    <div class="sect">FULL DAY PLAN — ${dowLabel()}</div>
+    <div class="relative" style="padding-left:14px">
+    <div class="absolute top-2 bottom-2" style="left:4px;width:2px;background:linear-gradient(180deg,rgba(212,175,55,.4),rgba(29,41,66,.6))"></div>
     ${STATE.blocks.map(b=>{
       const isNow = STATE.current && STATE.current.id===b.id;
       const done = b.log_status==='done', part = b.log_status==='partial', skip = b.log_status==='skipped';
+      const [sh,sm] = b.start_time.split(':').map(Number);
+      const past = (sh*60+sm) < nowMin && !isNow;
+      const dotColor = done?'#22c55e':skip?'#dc2626':part?'#f59e0b':isNow?'#d4af37':past?'#5d6b82':'#1d2942';
       return `
-      <article class="card p-3 mb-2 ${isNow?'border-gold/50':''} ${done?'opacity-60':''}">
+      <article class="card p-3 mb-2 relative ${isNow?'card-lux now-ring':''} ${done?'opacity-55':''}">
+        <div class="absolute rounded-full" style="left:-14px;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;background:${dotColor};box-shadow:0 0 8px ${dotColor}${isNow?';animation:flicker 1.5s infinite':''}"></div>
         <div class="flex items-center gap-2.5">
           <div class="text-center w-11 shrink-0">
             <p class="font-disp font-bold text-xs ${isNow?'text-gold':'text-gray-400'}">${b.start_time}</p>
@@ -215,9 +244,10 @@ function viewToday() {
           </div>
           ${statusBtns(b, true)}
         </div>
-        ${isNow?'<p class="text-[9px] text-gold font-bold tracking-widest mt-1.5 text-center">◄ YOU ARE HERE ►</p>':''}
+        ${isNow?'<p class="text-[9px] gold-text font-bold tracking-[.25em] mt-1.5 text-center">◄ YOU ARE HERE ►</p>':''}
       </article>`;
     }).join('')}
+    </div>
     <div id="laws-panel" class="mt-4">${LAWS_CACHE?renderLaws():'<button class="btn w-full p-3 bg-panel border border-line text-sm" onclick="loadLaws()"><i class="fas fa-scale-balanced mr-1 text-gold"></i> CHECK THE 7 LAWS (tonight)</button>'}</div>
   </section>`;
 }
@@ -256,8 +286,21 @@ function render() {
 }
 window.render = render;
 
+/* live countdown inside the NOW hero (updates every second, no re-render) */
+setInterval(()=>{
+  const el = document.getElementById('block-countdown');
+  if (!el || !STATE || !STATE.current) return;
+  const [eh,em] = STATE.current.end_time.split(':').map(Number);
+  const end = new Date(); end.setHours(eh,em,0,0);
+  let diff = Math.floor((end - new Date())/1000);
+  if (diff < 0) { el.textContent = 'BLOCK ENDED — LOG IT'; return; }
+  const h = Math.floor(diff/3600), m = Math.floor((diff%3600)/60), s2 = diff%60;
+  el.textContent = (h?`${h}h `:'')+`${String(m).padStart(2,'0')}:${String(s2).padStart(2,'0')} remaining`;
+}, 1000);
+
 (async function init(){
   try { await loadState(); render(); }
   catch(e){ app().innerHTML = `<div class="p-6 text-center text-red-400 text-sm">Failed to load the war room. Pull to refresh.<br>${esc(e.message||'')}</div>`; }
+  finally { FX.killSplash(); }
   setInterval(async ()=>{ if(TAB==='now'||TAB==='today'){ try{ await loadState(); render(); }catch(_){} } }, 60000);
 })();

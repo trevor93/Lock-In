@@ -11,15 +11,17 @@ function viewMind(){
 }
 
 function viewCards(){
-  if(!DUE.length) return '<div class="card p-6 text-center"><i class="fas fa-check-double text-2xl text-jade mb-2"></i><p class="text-sm font-bold">ALL PRINCIPLES DRILLED</p><p class="text-[11px] text-gray-500 mt-1">Spaced repetition is scheduling the next ambush. Come back tomorrow — this is how at-your-fingertips is built, rep by rep.</p></div>';
+  if(!DUE.length) return '<div class="card-lux p-6 text-center"><i class="fas fa-check-double text-3xl text-jade mb-2" style="filter:drop-shadow(0 0 12px rgba(34,197,94,.5))"></i><p class="font-disp font-bold text-lg text-white">ALL PRINCIPLES DRILLED</p><p class="text-[11px] text-gray-500 mt-1">Spaced repetition is scheduling the next ambush. Come back tomorrow — this is how at-your-fingertips is built, rep by rep.</p></div>';
   if(CARD_IDX>=DUE.length) CARD_IDX=0;
   const c=DUE[CARD_IDX];
-  let h='<p class="text-[10px] text-gray-500 text-center mb-2">CARD '+(CARD_IDX+1)+' / '+DUE.length+' · recall the MASTER reading before flipping</p>'+
-  '<div class="flip-card mb-3" onclick="CARD_FLIP=!CARD_FLIP;render()">'+
+  const pct=Math.round(((CARD_IDX)/DUE.length)*100);
+  let h='<div class="flex items-center gap-2 mb-2"><div class="prog flex-1"><div style="width:'+pct+'%"></div></div><span class="text-[10px] text-gray-500 font-bold">'+(CARD_IDX+1)+'/'+DUE.length+'</span></div>'+
+  '<p class="text-[10px] text-gray-500 text-center mb-2 tracking-wider">RECALL THE MASTER READING BEFORE FLIPPING</p>'+
+  '<div class="flip-card mb-3" onclick="FX.tap();CARD_FLIP=!CARD_FLIP;render()">'+
     '<div class="flip-inner '+(CARD_FLIP?'flipped':'')+'" style="min-height:230px">'+
-      '<div class="flip-face card gold-glow p-5 flex flex-col justify-center text-center" style="min-height:230px">'+
-        '<p class="pill bg-gray-800 text-gray-400 mx-auto mb-3">'+esc(c.source)+'</p>'+
-        '<p class="font-disp font-bold text-lg leading-snug">"'+esc(c.principle)+'"</p>'+
+      '<div class="flip-face card-lux gold-glow p-5 flex flex-col justify-center text-center" style="min-height:230px">'+
+        '<p class="pill pill-dim mx-auto mb-3">'+esc(c.source)+'</p>'+
+        '<p class="font-engraved font-bold text-base leading-snug text-white">“'+esc(c.principle)+'”</p>'+
         '<p class="text-[10px] text-gray-500 mt-4"><i class="fas fa-hand-pointer"></i> tap to reveal readings</p>'+
       '</div>'+
       '<div class="flip-back card p-4 overflow-y-auto" style="min-height:230px">'+
@@ -42,8 +44,10 @@ function viewCards(){
 
 async function gradeCard(mid,g){
   await api('post','/api/cards/'+mid+'/review',{grade:g,date:todayStr()});
-  if(g===0){ toast('Failed card returns soon. Sun Tzu: know yourself — including what you do not know yet.',true); }
+  if(g===0){ FX.fail(); toast('Failed card returns soon. Sun Tzu: know yourself — including what you do not know yet.',true); }
+  else FX.tap();
   DUE.splice(CARD_IDX,1); CARD_FLIP=false;
+  if(!DUE.length){ FX.confetti({count:70}); FX.toast('DRILL SESSION COMPLETE — all principles rehearsed','gold'); }
   render();
 }
 

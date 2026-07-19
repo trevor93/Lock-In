@@ -60,17 +60,21 @@ function viewHermes() {
     '<button class="btn w-full p-2.5 mt-2 bg-gold/15 border border-gold/40 text-gold text-xs font-bold" onclick="convene()"><i class="fas fa-chess-king mr-1"></i> CONVENE MORNING WAR COUNCIL (auto-review of my file)</button>' +
     '<button class="btn w-full p-2.5 mt-2 bg-indigo-900/50 border border-indigo-700 text-indigo-200 text-xs font-bold" onclick="showBridge()"><i class="fas fa-terminal mr-1"></i> HERMES BRIDGE — connect Termux / Telegram / CLI agent</button>' +
   '</div>' +
-  '<div id="hermes-log" class="mb-3">' +
-    (HERMES_HIST && HERMES_HIST.length ? HERMES_HIST.map(m =>
-      '<div class="card p-3 mb-2 ' + (m.role === 'assistant' ? 'border-gold/25' : '') + '">' +
-        '<p class="text-[9px] font-bold tracking-widest ' + (m.role === 'assistant' ? 'text-gold' : 'text-sky-400') + '">' + (m.role === 'assistant' ? '🦉 HERMES' : '⚔ COMMANDER') + ' · ' + (m.created_at || '').slice(5, 16) + '</p>' +
-        '<div class="text-xs text-gray-300 leading-relaxed mt-1 hermes-md">' + mdLite(m.content) + '</div>' +
-      '</div>').join('')
-    : '<div class="card p-4 text-center text-xs text-gray-500">No transmissions yet. Hermes is standing by with your complete file.</div>') +
+  '<div id="hermes-log" class="mb-3 flex flex-col gap-2">' +
+    (HERMES_HIST && HERMES_HIST.length ? HERMES_HIST.map(m => {
+      const isH = m.role === 'assistant';
+      const typing = isH && !m.created_at;
+      return '<div class="bubble ' + (isH ? 'bubble-hermes' : 'bubble-me') + ' fade-in">' +
+        '<p class="text-[8px] font-bold tracking-[.18em] mb-1 ' + (isH ? 'text-gold' : 'text-emerald-400') + '">' + (isH ? '🦉 HERMES' : '⚔ YOU') + (m.created_at ? ' · ' + m.created_at.slice(5, 16).replace('T',' ') : '') + '</p>' +
+        (typing
+          ? '<div class="typing-dots py-1"><span></span><span></span><span></span></div>'
+          : '<div class="text-[13px] text-gray-200 leading-relaxed hermes-md">' + mdLite(m.content) + '</div>') +
+      '</div>'; }).join('')
+    : '<div class="card-glass p-5 text-center"><i class="fas fa-feather-pointed text-gold text-xl mb-2"></i><p class="text-xs text-gray-400">No transmissions yet. Hermes is standing by with your complete file.</p></div>') +
   '</div>' +
-  '<div class="card p-2 flex gap-2 items-end sticky bottom-20">' +
-    '<textarea id="hermes-input" rows="2" placeholder="Speak to your counsel… (e.g. \'A classmate keeps borrowing money and dodging repayment — read this situation for me\')" class="flex-1"></textarea>' +
-    '<button class="btn p-3 bg-gold/20 border border-gold/50 text-gold" onclick="askHermes()"><i class="fas fa-paper-plane"></i></button>' +
+  '<div class="card-glass p-2 flex gap-2 items-end sticky bottom-20">' +
+    '<textarea id="hermes-input" rows="2" placeholder="Speak to your counsel, Commander…" class="flex-1"></textarea>' +
+    '<button class="btn btn-gold p-3" onclick="askHermes()"><i class="fas fa-paper-plane"></i></button>' +
   '</div>';
 }
 
@@ -93,7 +97,7 @@ async function askHermes() {
   el.value = '';
   HERMES_HIST = HERMES_HIST || [];
   HERMES_HIST.push({ role: 'user', content: msg, created_at: new Date().toISOString() });
-  HERMES_HIST.push({ role: 'assistant', content: '…analyzing your file…', created_at: '' });
+  HERMES_HIST.push({ role: 'assistant', content: '', created_at: '' });
   render();
   try {
     const r = await api('post', '/api/hermes', { message: msg, date: todayStr() });
@@ -166,7 +170,7 @@ async function fileIntel() {
     principle_used: $('#in-principle').value, verdict: $('#in-verdict').value, log_date: todayStr() };
   if (!b.title) { toast('A title is required — name the move.', true); return; }
   await api('post', '/api/intel', b);
-  toast('Intel filed into the record. +15 pts. Hermes now knows.');
+  FX.success(); FX.toast('INTEL FILED INTO THE RECORD  +15 — Hermes now knows','gold');
   INTEL_OPEN = false;
   INTEL = (await axios.get('/api/intel')).data;
   await loadState(); render();

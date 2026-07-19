@@ -23,32 +23,43 @@ window.renderExtra = async function(tab){
 const UST = {locked:['LOCKED','bg-gray-800 text-gray-500'],active:['ACTIVE','bg-gold/20 text-gold'],reading_done:['READING OK','bg-sky-950 text-sky-300'],drill_done:['DRILL OK','bg-emerald-950 text-emerald-300'],complete:['CONQUERED','bg-emerald-800 text-emerald-100']};
 
 function viewCampaign(){
+  const totalUnits = CAMPAIGN.reduce((a,p)=>a+p.total,0);
+  const totalDone  = CAMPAIGN.reduce((a,p)=>a+p.complete,0);
+  const warPct = totalUnits?Math.round(totalDone/totalUnits*100):0;
   return header()+
-  '<section id="campaign-section" class="fade-in">'+
-    '<h2 class="font-disp font-bold text-sm tracking-widest text-gray-400 mb-1">THE CAMPAIGN — PROGRESS-LOCKED</h2>'+
-    '<p class="text-[10px] text-gray-500 mb-3">Unit N unlocks when N−1 is conquered. No calendar pressure — you are a deep reader, not a fast one. Depth is the weapon.</p>'+
-    CAMPAIGN.map(p=>
-      '<article class="card p-3 mb-3">'+
+  '<section id="campaign-section" class="stagger">'+
+    '<div class="card-lux p-4 mb-3 flex items-center gap-4">'+
+      FX.ring(warPct, 84, 7, totalDone, 'OF '+totalUnits)+
+      '<div class="flex-1">'+
+        '<h2 class="font-engraved font-bold text-sm gold-text">THE CAMPAIGN</h2>'+
+        '<p class="text-[10px] text-gray-500 leading-relaxed mt-1">Progress-locked. Unit N opens only when N−1 falls. No calendar pressure — depth is the weapon.</p>'+
+      '</div>'+
+    '</div>'+
+    CAMPAIGN.map(p=>{
+      const trackColor = p.track==='strategy'?'#f43f5e':'#818cf8';
+      const phaseDone = p.complete===p.total && p.total>0;
+      return '<article class="'+(phaseDone?'card-lux':'card')+' p-3.5 mb-3">'+
         '<div class="flex items-center justify-between mb-1">'+
-          '<h3 class="font-disp font-bold text-sm '+(p.track==='strategy'?'text-rose-300':'text-indigo-300')+'">'+esc(p.title)+'</h3>'+
-          '<span class="text-[10px] font-bold text-gray-400">'+p.complete+'/'+p.total+'</span>'+
+          '<h3 class="font-disp font-bold text-sm tracking-wide" style="color:'+trackColor+'">'+(phaseDone?'🏆 ':'')+esc(p.title)+'</h3>'+
+          '<span class="pill '+(phaseDone?'pill-gold':'pill-dim')+'">'+p.complete+' / '+p.total+'</span>'+
         '</div>'+
         '<p class="text-[10px] text-gray-500 mb-2">'+esc(p.subtitle||'')+'</p>'+
-        '<div class="prog mb-2"><div style="width:'+p.progress+'%;background:'+(p.track==='strategy'?'#f43f5e':'#818cf8')+'"></div></div>'+
+        '<div class="prog mb-2"><div style="width:'+p.progress+'%"></div></div>'+
         p.units.map(u=>{
           const st=UST[u.status]||UST.locked;
           const open=OPEN_UNIT===u.id;
+          const isActive=['active','reading_done','drill_done'].includes(u.status);
           const icon=u.status==='locked'?'fa-lock text-gray-600':u.status==='complete'?'fa-flag text-emerald-400':u.is_exam?'fa-shield-halved text-gold':'fa-location-dot text-gold';
-          return '<div class="border-t border-line/50 py-2">'+
+          return '<div class="border-t border-line/50 py-2 '+(isActive?'-mx-2 px-2 rounded-lg" style="background:rgba(212,175,55,.05)':'')+'">'+
             '<button class="w-full flex items-center gap-2 text-left" onclick="toggleUnit('+u.id+')" '+(u.status==='locked'?'disabled':'')+'>'+
-              '<i class="fas '+icon+' text-xs w-4"></i>'+
+              '<i class="fas '+icon+' text-xs w-4 '+(isActive?'animate-pulse':'')+'"></i>'+
               '<span class="text-xs flex-1 '+(u.status==='locked'?'text-gray-600':'')+' '+(u.status==='complete'?'line-through text-gray-500':'')+'">'+esc(u.title)+'</span>'+
               '<span class="pill '+st[1]+'">'+st[0]+'</span>'+
             '</button>'+
             (open&&u.status!=='locked'?unitDetail(u):'')+
           '</div>';
         }).join('')+
-      '</article>').join('')+
+      '</article>';}).join('')+
   '</section>';
 }
 
@@ -92,7 +103,9 @@ async function unitStep(id, step){
   if(step==='drill') payload.drill_report=($('#drill-report-'+id)||{}).value||'';
   if(step==='complete'){ const el=$('#debrief-ans-'+id); if(el) payload.debrief_answer=el.value; }
   await api('post','/api/units/'+id+'/step',payload);
-  toast(step==='complete'?'UNIT CONQUERED. Next front unlocked. +50':step==='drill'?'Drill report filed. +30 pts.':'Reading logged. +20 pts. Now: the field drill.');
+  if(step==='complete'){ FX.confetti({count:110}); FX.toast('UNIT CONQUERED — NEXT FRONT UNLOCKED  +50','gold'); }
+  else if(step==='drill'){ FX.success(); toast('Drill report filed. +30 pts.'); }
+  else toast('Reading logged. +20 pts. Now: the field drill.');
   CAMPAIGN=(await axios.get('/api/campaign')).data; await loadState(); render();
 }
 
@@ -101,7 +114,7 @@ async function submitExam(id, n){
   if(answers.some(a=>a.trim().length<10)){ toast('Empty or one-line answers detected. This exam deserves real effort — the gate stays closed.', true); return; }
   const score=Number(($('#exam-score-'+id)||{}).value||0);
   const r=await api('post','/api/units/'+id+'/step',{step:'complete',exam_answers:answers,exam_self_score:score,date:todayStr()});
-  if(r.failed){ toast(r.message,true); } else { toast('EXAM PASSED. Phase gate opened. +100 pts.'); }
+  if(r.failed){ FX.fail(); toast(r.message,true); } else { FX.confetti({count:160}); FX.toast('EXAM PASSED — PHASE GATE OPENED  +100','gold'); }
   CAMPAIGN=(await axios.get('/api/campaign')).data; await loadState(); render();
 }
 
