@@ -15,6 +15,7 @@ window.renderExtra = async function(tab){
     if(!MAXIMS) MAXIMS=(await axios.get('/api/maxims')).data;
     shell(viewMind());
   }
+  else if (tab==='tongue'){ await window.loadTongue(); shell(window.viewTongue()); window.tongueAfterRender && window.tongueAfterRender(); }
   else if (tab==='debrief'){ if(!DEBRIEFS) DEBRIEFS=(await axios.get('/api/debriefs')).data; shell(viewDebrief()); }
   else if (tab==='stats'){ STATS=(await axios.get('/api/stats?date='+todayStr())).data; shell(viewStats()); }
 };

@@ -71,9 +71,10 @@ async function runHonestyEngine(DB: D1Database, today: string) {
   }
 
   // 2. Missed non-negotiable blocks yesterday
+  // (skip 'missed' — those were already punished LIVE by the same-day enforcement engine)
   const yBlocks = await blocksForDate(DB, y1)
   for (const b of yBlocks) {
-    if (b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial') {
+    if (b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial' && b.log_status !== 'missed') {
       if (!(await flagExists(DB, y1, 'missed_block', `#${b.id}]`))) {
         const skipped = b.log_status === 'skipped'
         await addFlag(DB, y1, 'missed_block', skipped ? 'warn' : 'serious',
@@ -96,6 +97,18 @@ async function runHonestyEngine(DB: D1Database, today: string) {
       }
     }
   }
+
+  // 3.5 TONGUE NEGLECT — drills piling up unreviewed means the armory is rotting
+  try {
+    const overdue = await DB.prepare(
+      `SELECT COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id
+       WHERE r.archived=0 AND s.due_date <= ?`
+    ).bind(addDays(today, -3)).first<any>()
+    if ((overdue?.n ?? 0) >= 5 && !(await flagExists(DB, y1, 'tongue_neglect'))) {
+      await addFlag(DB, y1, 'tongue_neglect', 'serious',
+        `TONGUE NEGLECT: ${overdue.n} wise responses are 3+ days overdue for drilling. You recorded wisdom and let it rot — a full armory you never trained with. -10 pts. Drill them today.`, -10)
+    }
+  } catch (_) { /* table may not exist pre-migration */ }
 
   // 4. Low adherence day
   const adh = dayAdherence(yBlocks)
@@ -133,6 +146,37 @@ async function computeStreak(DB: D1Database, today: string): Promise<number> {
   return streak
 }
 
+// ============ SAME-DAY ENFORCEMENT (real-time honesty — no free passes) ============
+// A block whose end_time + grace has passed with no log is AUTO-MARKED 'missed':
+// instant penalty, instant flag, window closed. The day bleeds while you watch.
+async function runSameDayEnforcement(DB: D1Database, date: string, time: string) {
+  const start = await DB.prepare(`SELECT value FROM settings WHERE key='start_date'`).first<{ value: string }>()
+  if (start?.value && date < start.value) return
+  const graceRow = await DB.prepare(`SELECT value FROM settings WHERE key='grace_minutes'`).first<{ value: string }>()
+  const grace = Math.max(0, Number(graceRow?.value ?? 30))
+  const [nh, nm] = time.split(':').map(Number)
+  const nowMin = nh * 60 + nm
+  const blocks = await blocksForDate(DB, date)
+  for (const b of blocks) {
+    if (b.log_status) continue                      // already logged (done/partial/skipped/missed/pending)
+    const [eh, em] = b.end_time.split(':').map(Number)
+    const deadline = eh * 60 + em + grace
+    if (nowMin <= deadline) continue                // still inside the window
+    // AUTO-CANCEL: the window closed unlogged
+    await DB.prepare(
+      `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
+       ON CONFLICT(block_id, log_date) DO NOTHING`
+    ).bind(b.id, date, 'missed', `AUTO-CANCELED: window closed unlogged at ${time} (grace ${grace}m).`).run()
+    const nn = !!b.is_non_negotiable
+    const penalty = nn ? -15 : -5
+    if (!(await flagExists(DB, date, 'missed_live', `#${b.id}]`))) {
+      await addFlag(DB, date, 'missed_live', nn ? 'critical' : 'warn',
+        `[Block #${b.id}] ${nn ? 'NON-NEGOTIABLE ' : ''}MISSED — CANCELED: "${b.title}" (${b.start_time}–${b.end_time}) ended unlogged. The window is closed. ${penalty} pts. It cannot be reopened — never miss twice.`,
+        penalty)
+    }
+  }
+}
+
 // ============ STATE (the war room heartbeat) ============
 app.get('/api/state', async (c) => {
   const DB = c.env.DB
@@ -140,6 +184,7 @@ app.get('/api/state', async (c) => {
   const time = c.req.query('time') || '12:00'
 
   await runHonestyEngine(DB, date)
+  await runSameDayEnforcement(DB, date, time)
 
   const blocks = await blocksForDate(DB, date)
   const current = blocks.find((b: any) => b.start_time <= time && time < b.end_time) || null
@@ -153,6 +198,9 @@ app.get('/api/state', async (c) => {
   const debrief = await DB.prepare(`SELECT * FROM debriefs WHERE log_date=?`).bind(date).first()
   const yDebrief = await DB.prepare(`SELECT * FROM debriefs WHERE log_date=?`).bind(addDays(date, -1)).first()
   const dueCards = await DB.prepare(`SELECT COUNT(*) as n FROM flashcards WHERE due_date <= ?`).bind(date).first<{ n: number }>()
+  const dueTongue = await DB.prepare(
+    `SELECT COUNT(*) as n FROM response_srs s JOIN responses r ON r.id=s.response_id WHERE r.archived=0 AND s.due_date <= ?`
+  ).bind(date).first<{ n: number }>().catch(() => ({ n: 0 }))
 
   // active units per track
   const activeUnits = (await DB.prepare(
@@ -166,7 +214,7 @@ app.get('/api/state', async (c) => {
     points: pts?.total ?? 0, todayPoints: todayPts?.total ?? 0,
     flags, debrief, debriefDoneToday: !!debrief,
     yesterdayTargets: (yDebrief as any)?.tomorrow_targets || null,
-    dueCards: dueCards?.n ?? 0, activeUnits
+    dueCards: dueCards?.n ?? 0, dueTongue: (dueTongue as any)?.n ?? 0, activeUnits
   })
 })
 
@@ -179,6 +227,11 @@ app.post('/api/blocks/:id/log', async (c) => {
   if (!block) return c.json({ error: 'no such block' }, 404)
 
   const prev = await DB.prepare(`SELECT * FROM block_logs WHERE block_id=? AND log_date=?`).bind(id, date).first<any>()
+  // THE WINDOW RULE: a block auto-canceled by the enforcement engine is CLOSED.
+  // You cannot rewrite history — the only exit is a formal appeal (which costs the truth).
+  if (prev && prev.status === 'missed') {
+    return c.json({ error: 'WINDOW CLOSED. "' + block.title + '" was auto-canceled unlogged — it cannot be reopened. The penalty stands. Win the next block.' }, 409)
+  }
   await DB.prepare(
     `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
      ON CONFLICT(block_id, log_date) DO UPDATE SET status=excluded.status, note=excluded.note, completed_at=excluded.completed_at`
@@ -386,6 +439,180 @@ app.post('/api/flags/:id/ack', async (c) => {
 app.get('/api/flags/history', async (c) => {
   const { results } = await c.env.DB.prepare(`SELECT * FROM honesty_flags ORDER BY created_at DESC LIMIT 100`).all()
   return c.json(results)
+})
+
+// ============ THE TONGUE — WISE-RESPONSE ARMORY + SUPREME MEMORIZATION ============
+// Mastery ladder: new → learning (3+ correct) → memorized (7+ correct, interval≥7d)
+//                 → ingrained (14+ correct, interval≥21d) → reflex (25+ correct, interval≥45d)
+function tongueMastery(s: any): string {
+  const cr = s.correct_reviews, iv = s.interval_days
+  if (cr >= 25 && iv >= 45) return 'reflex'
+  if (cr >= 14 && iv >= 21) return 'ingrained'
+  if (cr >= 7 && iv >= 7) return 'memorized'
+  if (cr >= 3) return 'learning'
+  return 'new'
+}
+
+// Capture a wise response (the daily field-recording ritual)
+app.post('/api/tongue', async (c) => {
+  const DB = c.env.DB
+  const { situation, trigger_q, response, why_works, source, category } = await c.req.json()
+  if (!situation?.trim() || !trigger_q?.trim() || !response?.trim())
+    return c.json({ error: 'Situation, the question, and the exact response are all required. Record it fully or it is lost.' }, 400)
+  const today = new Date().toISOString().slice(0, 10)
+  const r = await DB.prepare(
+    `INSERT INTO responses (situation, trigger_q, response, why_works, source, category) VALUES (?,?,?,?,?,?)`
+  ).bind(situation.trim(), trigger_q.trim(), response.trim(), (why_works || '').trim() || null, (source || '').trim() || null, category || 'wit').run()
+  const rid = r.meta.last_row_id
+  await DB.prepare(`INSERT INTO response_srs (response_id, due_date) VALUES (?,?)`).bind(rid, today).run()
+  await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+    .bind(today, 3, `INTEL CAPTURED: recorded a wise response ("${String(trigger_q).slice(0, 50)}…"). +3 pts. Now memorize it.`, 'tongue', rid).run()
+  return c.json({ ok: true, id: rid })
+})
+
+// List / filter the armory
+app.get('/api/tongue', async (c) => {
+  const DB = c.env.DB
+  const cat = c.req.query('category')
+  const q = c.req.query('q')
+  let sql = `SELECT r.*, s.mastery, s.due_date, s.reps, s.lapses, s.interval_days, s.total_reviews, s.correct_reviews
+             FROM responses r JOIN response_srs s ON s.response_id=r.id WHERE r.archived=0`
+  const binds: any[] = []
+  if (cat && cat !== 'all') { sql += ` AND r.category=?`; binds.push(cat) }
+  if (q) { sql += ` AND (r.situation LIKE ? OR r.trigger_q LIKE ? OR r.response LIKE ?)`; binds.push(`%${q}%`, `%${q}%`, `%${q}%`) }
+  sql += ` ORDER BY r.created_at DESC LIMIT 300`
+  const { results } = await DB.prepare(sql).bind(...binds).all()
+  return c.json(results)
+})
+
+app.put('/api/tongue/:id', async (c) => {
+  const DB = c.env.DB
+  const id = Number(c.req.param('id'))
+  const { situation, trigger_q, response, why_works, source, category } = await c.req.json()
+  await DB.prepare(`UPDATE responses SET situation=?, trigger_q=?, response=?, why_works=?, source=?, category=? WHERE id=?`)
+    .bind(situation, trigger_q, response, why_works || null, source || null, category || 'wit', id).run()
+  return c.json({ ok: true })
+})
+app.delete('/api/tongue/:id', async (c) => {
+  await c.env.DB.prepare(`UPDATE responses SET archived=1 WHERE id=?`).bind(Number(c.req.param('id'))).run()
+  return c.json({ ok: true })
+})
+
+// Due drills — each response is served with a rotating challenge mode so the
+// brain is attacked from 5 angles: recall / cloze / first_letters / reverse / delivery
+app.get('/api/tongue/due', async (c) => {
+  const DB = c.env.DB
+  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const { results } = await DB.prepare(
+    `SELECT r.*, s.mastery, s.due_date, s.reps, s.lapses, s.interval_days, s.total_reviews, s.correct_reviews, s.last_mode
+     FROM responses r JOIN response_srs s ON s.response_id=r.id
+     WHERE r.archived=0 AND s.due_date <= ? ORDER BY s.due_date LIMIT 20`
+  ).bind(date).all()
+  const MODES = ['recall', 'cloze', 'first_letters', 'reverse', 'delivery']
+  const out = (results as any[]).map((r: any) => {
+    // rotate: never repeat the last mode; deeper mastery gets harder modes more often
+    let pool = MODES.filter(m => m !== r.last_mode)
+    if (r.mastery === 'ingrained' || r.mastery === 'reflex') pool = pool.filter(m => m !== 'recall')
+    const mode = pool[Math.floor(Math.random() * pool.length)] || 'recall'
+    return { ...r, drill_mode: mode }
+  })
+  return c.json(out)
+})
+
+// Grade a drill (0 blank | 1 shaky | 2 solid | 3 fluent) — SM-2 with mastery ladder
+app.post('/api/tongue/:id/review', async (c) => {
+  const DB = c.env.DB
+  const id = Number(c.req.param('id'))
+  const { grade, mode, date } = await c.req.json()
+  const s = await DB.prepare(`SELECT * FROM response_srs WHERE response_id=?`).bind(id).first<any>()
+  if (!s) return c.json({ error: 'no such response' }, 404)
+  let { interval_days, ease, reps, lapses, total_reviews, correct_reviews } = s
+  total_reviews++
+  if (grade === 0) { lapses++; reps = 0; interval_days = 0; ease = Math.max(1.3, ease - 0.2) }
+  else {
+    reps++; correct_reviews++
+    ease = Math.max(1.3, ease + (grade === 3 ? 0.1 : grade === 1 ? -0.15 : 0))
+    if (reps === 1) interval_days = 1
+    else if (reps === 2) interval_days = 3
+    else interval_days = Math.round(interval_days * ease * (grade === 1 ? 0.8 : grade === 3 ? 1.3 : 1))
+  }
+  const today = date || new Date().toISOString().slice(0, 10)
+  const due = addDays(today, Math.max(interval_days, grade === 0 ? 0 : 1))
+  const mastery = tongueMastery({ correct_reviews, interval_days })
+  const prevMastery = s.mastery
+  await DB.prepare(
+    `UPDATE response_srs SET interval_days=?, ease=?, reps=?, lapses=?, due_date=?, mastery=?, total_reviews=?, correct_reviews=?, last_mode=? WHERE response_id=?`
+  ).bind(interval_days, ease, reps, lapses, due, mastery, total_reviews, correct_reviews, mode || 'recall', id).run()
+  await DB.prepare(`INSERT INTO tongue_reviews (response_id, review_date, mode, grade) VALUES (?,?,?,?)`)
+    .bind(id, today, mode || 'recall', grade).run()
+  // Mastery promotion bonuses — real, earned progress
+  let promoted: string | null = null
+  if (mastery !== prevMastery) {
+    const bonus: any = { learning: 2, memorized: 8, ingrained: 15, reflex: 30 }
+    if (bonus[mastery]) {
+      promoted = mastery
+      const r = await DB.prepare(`SELECT trigger_q FROM responses WHERE id=?`).bind(id).first<any>()
+      await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+        .bind(today, bonus[mastery], `TONGUE ${mastery.toUpperCase()}: "${String(r?.trigger_q || '').slice(0, 50)}…" climbed to ${mastery.toUpperCase()}. +${bonus[mastery]} pts.`, 'tongue', id).run()
+    }
+  }
+  return c.json({ ok: true, next_due: due, mastery, promoted })
+})
+
+// Weekly exam — strict. 10 random armed responses (or all if fewer). Pass ≥ 80%.
+app.get('/api/tongue/exam', async (c) => {
+  const DB = c.env.DB
+  const { results } = await DB.prepare(
+    `SELECT r.id, r.situation, r.trigger_q, r.response, r.category, s.mastery
+     FROM responses r JOIN response_srs s ON s.response_id=r.id
+     WHERE r.archived=0 AND s.total_reviews > 0 ORDER BY RANDOM() LIMIT 10`
+  ).all()
+  return c.json(results)
+})
+app.post('/api/tongue/exam/submit', async (c) => {
+  const DB = c.env.DB
+  const { total, correct, date } = await c.req.json()
+  const today = date || new Date().toISOString().slice(0, 10)
+  const pct = total ? Math.round((correct / total) * 100) : 0
+  const passed = pct >= 80 ? 1 : 0
+  await DB.prepare(`INSERT INTO tongue_exams (exam_date, total, correct, score_pct, passed) VALUES (?,?,?,?,?)`)
+    .bind(today, total, correct, pct, passed).run()
+  if (passed) {
+    await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
+      .bind(today, 25, `TONGUE EXAM PASSED: ${correct}/${total} (${pct}%). The armory is in your head. +25 pts.`, 'tongue').run()
+  } else {
+    await addFlag(DB, today, 'tongue_exam_failed', 'serious',
+      `TONGUE EXAM FAILED: ${correct}/${total} (${pct}%). You recorded wisdom you cannot recall — that is decoration, not armament. −10 pts. Drill and retake.`, -10)
+  }
+  return c.json({ ok: true, score_pct: pct, passed: !!passed })
+})
+
+// Tongue stats — the real-progress dashboard
+app.get('/api/tongue/stats', async (c) => {
+  const DB = c.env.DB
+  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const byMastery = (await DB.prepare(
+    `SELECT s.mastery, COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id WHERE r.archived=0 GROUP BY s.mastery`
+  ).all()).results
+  const totals = await DB.prepare(
+    `SELECT COUNT(*) total FROM responses WHERE archived=0`).first<any>()
+  const due = await DB.prepare(
+    `SELECT COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id WHERE r.archived=0 AND s.due_date<=?`).bind(date).first<any>()
+  const reviews7 = await DB.prepare(
+    `SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN grade>=2 THEN 1 ELSE 0 END),0) solid FROM tongue_reviews WHERE review_date >= ?`
+  ).bind(addDays(date, -7)).first<any>()
+  const exams = (await DB.prepare(`SELECT * FROM tongue_exams ORDER BY created_at DESC LIMIT 8`).all()).results
+  const captured7 = await DB.prepare(
+    `SELECT COUNT(*) n FROM responses WHERE archived=0 AND created_at >= datetime(?, '-7 days')`).bind(date + ' 00:00:00').first<any>()
+  const byCat = (await DB.prepare(
+    `SELECT category, COUNT(*) n FROM responses WHERE archived=0 GROUP BY category ORDER BY n DESC`).all()).results
+  const lastExam = (exams as any[])[0] || null
+  const weekExamDone = lastExam && (lastExam as any).exam_date >= addDays(date, -6)
+  return c.json({
+    total: totals?.total ?? 0, due: due?.n ?? 0, byMastery, byCat,
+    reviews7: reviews7?.n ?? 0, solid7: reviews7?.solid ?? 0,
+    captured7: captured7?.n ?? 0, exams, weekExamDone: !!weekExamDone
+  })
 })
 
 // ============ LAWS ============
@@ -949,6 +1176,7 @@ app.get('/', (c) => c.html(`<!DOCTYPE html>
 <script src="/static/app4.js"></script>
 <script src="/static/app5.js"></script>
 <script src="/static/app6.js"></script>
+<script src="/static/app7.js"></script>
 <script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js');}</script>
 </body>
 </html>`))

@@ -24,10 +24,13 @@ A private, progress-based, honesty-driven life-command system. Not a calendar ap
 | **STATS** | Weekly adherence %, streaks, points ledger, honesty flags |
 
 ## Key Systems
-- **Honesty Engine** — runs server-side on every `/api/state`: evaluates yesterday/day-before, files flags (missed debrief, unlogged non-negotiables, skipped drills), applies point penalties, awards victory-day bonuses, enforces "never miss twice".
+- **Honesty Engine** — runs server-side on every `/api/state`: evaluates yesterday/day-before, files flags (missed debrief, unlogged non-negotiables, skipped drills, tongue neglect), applies point penalties, awards victory-day bonuses, enforces "never miss twice".
+- **Same-Day Enforcement (REAL-TIME)** — any block whose window closed (`end_time` + `grace_minutes`, default 30) without a log is **AUTO-CANCELED live**: written as `status='missed'`, instant `missed_live` flag + penalty (−15 non-negotiable, −5 normal). The block renders struck-through with a red ✖ CANCELED pill and its buttons are gone. Re-logging returns **409 WINDOW CLOSED** — a missed block can never be reopened. Next-day engine skips already-punished blocks (no double jeopardy).
+- **THE TONGUE — Wise-Response Armory** — capture every smart, wise, unreadable response you hear (situation + exact question + exact line + why it works + source + 10 categories: deflection/wit/power/mystery/boundaries/praise/conflict/small-talk/negotiation/silence). A supreme memorization engine then drills each line into long-term memory with **5 rotating attack modes** (situation drill, cloze gaps, first-letters, reverse-binding, out-loud delivery reps), SM-2 spaced repetition, and a **mastery ladder**: NEW → LEARNING → MEMORIZED → INGRAINED → REFLEX (25 solid recalls + 45-day interval = fires in live conversation without thinking). Strict **weekly exam** (10 random lines, pass ≥80% → +25 pts; fail → flag + −10). Letting 5+ drills rot 3+ days files a TONGUE NEGLECT flag. Capture = +3 pts; every mastery promotion pays a bonus.
 - **Progress Locking** — `ensureUnlocks` walks each track; the first incomplete unit is the only active one. Locked units reject all writes.
 - **Points Economy** — earn: blocks, units, exams, debriefs, book chapters. Lose: flags. Spend: rewards store.
-- **Alarms** — 3 layers: (1) in-app Web Audio "war horn" + banner, (2) service-worker notifications (PWA), (3) `.ics` export with RRULE+VALARM → device-native alarms that ring even with the app closed.
+- **Alarms** — 3 layers: (1) in-app **luxury grand-chime** (Web Audio bell synthesis: bronze bell partials, velvet attack, long decay, lowpass warmth + compressor, G4→B4→D5→G5 motif) + gold banner, (2) service-worker heads-up notifications (`requireInteraction`, refined vibration, action button; auto-cancel fires a dedicated ✖ CANCELED notification + toast), (3) `.ics` export with RRULE+VALARM → device-native alarms that ring even with the app closed.
+  - *Android heads-up popups:* set the browser/PWA notification channel to **High/Urgent** ("pop on screen") in Settings → Apps → Notifications — web apps cannot force this.
 - **Real Books** — 11 public-domain official translations parsed to JSON, served statically, cached offline by the service worker: Art of War, The Prince, Discourses on Livy, Meditations, Enchiridion, Apology, Crito, The Republic, Zarathustra, Beyond Good & Evil, On War.
 
 ## 🔗 Hermes Bridge (Termux / Telegram / CLI)
@@ -64,4 +67,4 @@ npm run db:seed                        # seed schedule/laws/rewards
 - **Tech Stack**: Hono + TypeScript + Cloudflare D1 + Tailwind CDN + vanilla JS + PWA
 - **Status**: ✅ Fully working in sandbox (⚠ in-app Hermes chat requires a valid LLM API key injection)
 - **Design**: Luxury v2 — layered-black glassmorphism, engraved gold (Cinzel), FX engine (confetti, haptics, count-up, progress rings), rank ladder (RECRUIT→SOVEREIGN), streak flame tiers, timeline day view, WhatsApp-grade council chat, premium book reader with drop caps
-- **Last Updated**: 2026-07-15
+- **Last Updated**: 2026-07-27

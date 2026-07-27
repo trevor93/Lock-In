@@ -23,35 +23,73 @@ const Alarm = {
     setInterval(() => this.tick(), 15000);
   },
 
-  // war-horn style alarm: 3 rising blasts, repeated
+  /* LUXURY GRAND CHIME — concert-hall bell synthesis.
+     Each strike = fundamental + inharmonic bell partials (×2.76, ×5.4, ×8.9 like a real bronze bell),
+     soft attack, long exponential decay, warm lowpass, subtle stereo shimmer + hall reverb tail. */
+  _bell(ctx, master, freq, when, vel, dur) {
+    const partials = [
+      [1.0,    1.00, dur],          // hum / prime
+      [2.0,    0.42, dur * 0.82],   // octave
+      [2.76,   0.28, dur * 0.60],   // minor-third bell partial
+      [5.40,   0.12, dur * 0.38],   // shimmer
+      [8.93,   0.05, dur * 0.22]    // sparkle
+    ];
+    for (const [ratio, amp, d] of partials) {
+      const o = ctx.createOscillator(), g = ctx.createGain(), p = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+      o.type = 'sine'; o.frequency.value = freq * ratio;
+      // slight natural detune drift on upper partials
+      if (ratio > 2) o.detune.setValueAtTime((Math.random() - 0.5) * 6, when);
+      g.gain.setValueAtTime(0.0001, when);
+      g.gain.exponentialRampToValueAtTime(vel * amp, when + 0.012);          // velvet attack
+      g.gain.exponentialRampToValueAtTime(vel * amp * 0.35, when + d * 0.25); // body
+      g.gain.exponentialRampToValueAtTime(0.0001, when + d);                 // long silk decay
+      if (p) { p.pan.value = (ratio > 2 ? (Math.random() - 0.5) * 0.5 : 0); o.connect(g); g.connect(p); p.connect(master); }
+      else { o.connect(g); g.connect(master); }
+      o.start(when); o.stop(when + d + 0.05);
+    }
+  },
+
   ring(times = 3) {
     if (!this.ctx) { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; } }
     const ctx = this.ctx;
     if (ctx.state === 'suspended') ctx.resume();
-    let t = ctx.currentTime;
+    const t0 = ctx.currentTime + 0.03;
+
+    // Master chain: gentle lowpass warmth + soft-knee compressor (no harshness at volume)
+    const master = ctx.createGain(); master.gain.value = Math.min(this.volume, 0.9);
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 5200; lp.Q.value = 0.6;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -18; comp.knee.value = 24; comp.ratio.value = 5; comp.attack.value = 0.004; comp.release.value = 0.30;
+    master.connect(lp); lp.connect(comp); comp.connect(ctx.destination);
+
+    // Grand-hotel motif: G4 → B4 → D5 → G5 ascending, resolving strike each repeat
+    const motif = [392.0, 493.88, 587.33, 783.99];
+    const gap = 0.34, phrase = motif.length * gap + 1.6;
     for (let r = 0; r < times; r++) {
-      [392, 523, 659].forEach((f, i) => {
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.type = 'square'; o.frequency.value = f;
-        g.gain.setValueAtTime(0.0001, t + r * 1.4 + i * 0.38);
-        g.gain.exponentialRampToValueAtTime(this.volume, t + r * 1.4 + i * 0.38 + 0.04);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + r * 1.4 + i * 0.38 + 0.34);
-        o.connect(g); g.connect(ctx.destination);
-        o.start(t + r * 1.4 + i * 0.38); o.stop(t + r * 1.4 + i * 0.38 + 0.36);
-      });
+      const base = t0 + r * phrase;
+      motif.forEach((f, i) => this._bell(ctx, master, f, base + i * gap, 0.5 - i * 0.06 + (i === motif.length - 1 ? 0.18 : 0), i === motif.length - 1 ? 3.2 : 1.6));
+      // low warm anchor under the final strike (adds gravitas)
+      this._bell(ctx, master, 196.0, base + (motif.length - 1) * gap, 0.22, 3.4);
     }
-    if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 700]);
+    if (navigator.vibrate) navigator.vibrate([180, 90, 180, 90, 420]); // refined, less jarring pattern
   },
 
-  notify(title, body) {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      try {
-        navigator.serviceWorker?.ready?.then(reg => reg.showNotification(title, {
-          body, icon: '/static/icon.svg', badge: '/static/icon.svg',
-          vibrate: [400, 150, 400], tag: 'warroom-block', renotify: true, requireInteraction: true
-        })).catch(() => new Notification(title, { body }));
-      } catch (e) { try { new Notification(title, { body }); } catch (_) {} }
-    }
+  notify(title, body, tag = 'warroom-block') {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') { Notification.requestPermission(); return; }
+    if (Notification.permission !== 'granted') return;
+    const opts = {
+      body, icon: '/static/icon.svg', badge: '/static/icon.svg',
+      vibrate: [180, 90, 180, 90, 420],
+      tag, renotify: true, requireInteraction: true, silent: false,
+      timestamp: Date.now(),
+      data: { url: '/' },
+      actions: [{ action: 'open', title: '⚔ REPORT FOR DUTY' }]
+    };
+    try {
+      navigator.serviceWorker?.ready?.then(reg => reg.showNotification(title, opts))
+        .catch(() => { try { new Notification(title, { body, icon: '/static/icon.svg' }); } catch (_) {} });
+    } catch (e) { try { new Notification(title, { body }); } catch (_) {} }
   },
 
   tick() {
@@ -69,8 +107,23 @@ const Alarm = {
         this.banner(b);
       }
     }
-    // refresh state so current-block view stays live
-    loadState().then(() => { if (TAB === 'now') render(); }).catch(() => {});
+    // refresh state so current-block view stays live — and detect fresh auto-cancellations
+    const prevMissed = new Set((STATE.blocks || []).filter(b => b.log_status === 'missed').map(b => b.id));
+    loadState().then(() => {
+      for (const b of (STATE.blocks || [])) {
+        if (b.log_status === 'missed' && !prevMissed.has(b.id)) {
+          const mkey = today + '-missed-' + b.id;
+          if (!this.fired[mkey]) {
+            this.fired[mkey] = 1;
+            sessionStorage.setItem('wr_fired', JSON.stringify(this.fired));
+            this.notify('✖ CANCELED — ' + b.title, 'Window closed unlogged. The block is gone and the penalty is on your ledger. — Law 2: The plan is law.', 'warroom-missed');
+            if (window.FX) FX.toast('✖ “' + b.title + '” AUTO-CANCELED — PENALTY APPLIED', 'bad');
+            if (navigator.vibrate) navigator.vibrate([500, 120, 500]);
+          }
+        }
+      }
+      if (TAB === 'now' || TAB === 'today') render();
+    }).catch(() => {});
   },
 
   banner(b) {

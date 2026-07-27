@@ -41,6 +41,7 @@ function tabBadge(id) {
   const s = STATE; if (!s) return 0;
   if (id==='now')  return s.flags.length;
   if (id==='mind') return s.dueCards||0;
+  if (id==='tongue') return s.dueTongue||0;
   if (id==='debrief') return s.debriefDoneToday ? 0 : (new Date().getHours()>=20 ? 1 : 0);
   return 0;
 }
@@ -52,6 +53,7 @@ function shell(content) {
     ['library','fa-book-bookmark','BOOKS'],
     ['council','fa-user-secret','COUNCIL'],
     ['mind','fa-brain','MIND'],
+    ['tongue','fa-comment-dots','TONGUE'],
     ['debrief','fa-pen-nib','LOG'],
     ['stats','fa-chart-line','STATS'],
   ];
@@ -122,6 +124,10 @@ async function ackFlag(id){ await api('post',`/api/flags/${id}/ack`); await load
 /* ================= NOW TAB ================= */
 function statusBtns(b, compact=false) {
   const st = b.log_status;
+  if (st === 'missed') {
+    return `<span class="pill" style="background:rgba(153,27,27,.25);color:#f87171;border:1px solid rgba(220,38,38,.45);letter-spacing:.12em">
+      <i class="fas fa-ban text-[9px]"></i>CANCELED</span>`;
+  }
   const mk = (val, ic, cls, active) => `
     <button class="btn ${compact?'px-2.5 py-1.5 text-[11px]':'px-3 py-2 text-xs'} ${active?cls:'bg-gray-800/60 text-gray-500 border border-line'}"
       onclick="logBlock(${b.id},'${st===val?'pending':val}',event)"><i class="fas ${ic}"></i></button>`;
@@ -134,7 +140,11 @@ function statusBtns(b, compact=false) {
 async function logBlock(id, status, ev){
   const el = ev && ev.target ? ev.target.closest('button') : null;
   const b = (STATE.blocks||[]).find(x=>x.id===id);
-  await api('post',`/api/blocks/${id}/log`,{date:todayStr(),status});
+  try {
+    await api('post',`/api/blocks/${id}/log`,{date:todayStr(),status});
+  } catch(e) {
+    FX.fail(); await loadState(); render(); return; // 409 WINDOW CLOSED — api() already toasted
+  }
   if (status==='done') { FX.success(); if (b) FX.floatDelta(b.points, el); }
   else if (status==='skipped') FX.fail();
   await loadState(); render();
@@ -166,6 +176,7 @@ function viewNow() {
       <h2 class="font-disp font-bold text-2xl leading-tight mb-1 text-white">${esc(c.title)}</h2>
       <p class="text-xs text-gray-400 leading-relaxed mb-3">${esc(c.description||'')}</p>
       ${c.is_non_negotiable?'<span class="pill pill-blood mb-3 inline-flex"><i class="fas fa-lock text-[8px]"></i>NON-NEGOTIABLE</span>':''}
+      ${c.log_status==='missed'?`<p class="text-[10px] text-red-400 font-bold tracking-[.2em] mb-2"><i class="fas fa-ban"></i> WINDOW CLOSED — AUTO-CANCELED. PENALTY APPLIED.</p>`:''}
       <div class="flex justify-center">${statusBtns(c)}</div>
     </article>`:`
     <article class="card-lux p-6 mb-3 text-center">
@@ -223,12 +234,12 @@ function viewToday() {
     <div class="absolute top-2 bottom-2" style="left:4px;width:2px;background:linear-gradient(180deg,rgba(212,175,55,.4),rgba(29,41,66,.6))"></div>
     ${STATE.blocks.map(b=>{
       const isNow = STATE.current && STATE.current.id===b.id;
-      const done = b.log_status==='done', part = b.log_status==='partial', skip = b.log_status==='skipped';
+      const done = b.log_status==='done', part = b.log_status==='partial', skip = b.log_status==='skipped', missed = b.log_status==='missed';
       const [sh,sm] = b.start_time.split(':').map(Number);
       const past = (sh*60+sm) < nowMin && !isNow;
-      const dotColor = done?'#22c55e':skip?'#dc2626':part?'#f59e0b':isNow?'#d4af37':past?'#5d6b82':'#1d2942';
+      const dotColor = done?'#22c55e':(skip||missed)?'#dc2626':part?'#f59e0b':isNow?'#d4af37':past?'#5d6b82':'#1d2942';
       return `
-      <article class="card p-3 mb-2 relative ${isNow?'card-lux now-ring':''} ${done?'opacity-55':''}">
+      <article class="card p-3 mb-2 relative ${isNow?'card-lux now-ring':''} ${done?'opacity-55':''} ${missed?'opacity-70':''}" ${missed?'style="border-color:rgba(220,38,38,.35);background:linear-gradient(135deg,rgba(60,10,10,.35),rgba(15,20,32,.9))"':''}>
         <div class="absolute rounded-full" style="left:-14px;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;background:${dotColor};box-shadow:0 0 8px ${dotColor}${isNow?';animation:flicker 1.5s infinite':''}"></div>
         <div class="flex items-center gap-2.5">
           <div class="text-center w-11 shrink-0">
@@ -237,10 +248,10 @@ function viewToday() {
           </div>
           <i class="fas ${CAT_ICON[b.category]||'fa-circle'} cat-${b.category} text-sm w-4"></i>
           <div class="flex-1 min-w-0">
-            <p class="text-xs font-semibold ${done?'line-through':''} ${skip?'text-red-400':''}">${esc(b.title)}
+            <p class="text-xs font-semibold ${done||missed?'line-through':''} ${skip||missed?'text-red-400':''}">${esc(b.title)}
               ${b.is_non_negotiable?'<i class="fas fa-lock text-[8px] text-red-500 ml-1"></i>':''}
             </p>
-            <p class="text-[10px] text-gray-500">+${b.points} pts ${part?'· partial':''}</p>
+            <p class="text-[10px] ${missed?'text-red-500 font-bold tracking-wider':'text-gray-500'}">${missed?'✖ MISSED — WINDOW CLOSED · PENALTY TAKEN':`+${b.points} pts ${part?'· partial':''}`}</p>
           </div>
           ${statusBtns(b, true)}
         </div>
