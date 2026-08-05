@@ -102,10 +102,15 @@ body::after {
   border-top:1px solid var(--line-soft);
   padding-bottom:env(safe-area-inset-bottom);
   box-shadow:0 -8px 30px rgba(0,0,0,.5);
+  overflow-x:auto; overflow-y:hidden;
+  scrollbar-width:none; -ms-overflow-style:none;
+  -webkit-overflow-scrolling:touch;
 }
+.tabbar::-webkit-scrollbar { display:none; }
 .tab-btn {
-  flex:1; padding:.6rem 0 .5rem; text-align:center; position:relative;
-  color:var(--tx-3); font-size:.52rem; font-weight:700; letter-spacing:.06em;
+  flex:1 0 max(11%, 46px); min-width:0; padding:.6rem 1px .5rem; text-align:center; position:relative;
+  color:var(--tx-3); font-size:.5rem; font-weight:700; letter-spacing:.04em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   transition:color .25s ease, transform .15s ease;
 }
 .tab-btn i { display:block; font-size:1.02rem; margin-bottom:3px; transition:transform .25s cubic-bezier(.34,1.56,.64,1); }

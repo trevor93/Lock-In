@@ -158,14 +158,18 @@ async function runSameDayEnforcement(DB: D1Database, date: string, time: string)
   const nowMin = nh * 60 + nm
   const blocks = await blocksForDate(DB, date)
   for (const b of blocks) {
-    if (b.log_status) continue                      // already logged (done/partial/skipped/missed/pending)
+    // 'pending' is NOT a real log — toggling a block back to pending after the
+    // window closes must NOT let it escape the cancellation (honesty loophole).
+    if (b.log_status && b.log_status !== 'pending') continue
     const [eh, em] = b.end_time.split(':').map(Number)
     const deadline = eh * 60 + em + grace
     if (nowMin <= deadline) continue                // still inside the window
-    // AUTO-CANCEL: the window closed unlogged
+    // AUTO-CANCEL: the window closed unlogged (overwrites a lingering 'pending' row)
     await DB.prepare(
       `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
-       ON CONFLICT(block_id, log_date) DO NOTHING`
+       ON CONFLICT(block_id, log_date) DO UPDATE SET
+         status='missed', note=excluded.note, completed_at=excluded.completed_at
+       WHERE block_logs.status='pending'`
     ).bind(b.id, date, 'missed', `AUTO-CANCELED: window closed unlogged at ${time} (grace ${grace}m).`).run()
     const nn = !!b.is_non_negotiable
     const penalty = nn ? -15 : -5

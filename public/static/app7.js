@@ -99,7 +99,9 @@ function viewTongue(){
 window.viewTongue = viewTongue;
 
 async function tgRefresh(){
-  if (TG.view==='armory') TG.list = (await axios.get('/api/tongue?category='+TG.filter+(TG.search?'&q='+encodeURIComponent(TG.search):''))).data;
+  try {
+    await loadTongue(); // refreshes stats + due (and the armory list when view==='armory')
+  } catch(_){}
   render();
 }
 window.tgRefresh = tgRefresh;
@@ -219,7 +221,7 @@ function tgDrillCard(){
       <p class="text-xs text-gray-400 mt-1">${s.done} lines attacked · ${s.fluent} fluent</p>
       <p class="text-[10px] text-gray-500 mt-2 leading-relaxed">Every honest grade tightens the schedule. Lines you almost lost come back tomorrow; lines you own retreat for weeks — that is long-term memory being built.</p>
       <button class="btn btn-gold mt-3 px-6 py-2 text-xs font-bold" onclick="tgRefresh()">BACK TO TRAINING GROUND</button>
-    </div>` + '';
+    </div>`;
   }
   const r = list[TG.drillIdx];
   const mode = r.drill_mode || 'recall';
@@ -313,7 +315,7 @@ async function tgGrade(id, grade, mode){
   try {
     const res = await api('post', `/api/tongue/${id}/review`, { grade, mode, date: todayStr() });
     TG.drillSession.done++;
-    if (grade>=2) TG.drillSession.fluent += (grade===3?1:0);
+    if (grade===3) TG.drillSession.fluent++;
     if (grade===0) FX.fail(); else if (grade===3) FX.success(); else FX.tap();
     if (res.promoted){
       FX.confetti({count:70});
@@ -427,7 +429,8 @@ function tgExamView(){
   </div>`;
 }
 async function tgStartExam(){
-  TG.exam = (await axios.get('/api/tongue/exam')).data;
+  try { TG.exam = (await axios.get('/api/tongue/exam')).data; }
+  catch(_){ FX.toast('Could not load the exam — try again.','bad'); return; }
   if (!TG.exam.length){ FX.toast('No trained lines yet — drill first.','bad'); TG.exam=null; return; }
   TG.examIdx=0; TG.examReveal=false; TG.examCorrect=0;
   render();
