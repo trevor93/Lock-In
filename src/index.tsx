@@ -1,9 +1,141 @@
 import { Hono } from 'hono'
-import { cors } from 'hono/cors'
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 
 type Bindings = { DB: D1Database; OPENAI_API_KEY: string; OPENAI_BASE_URL: string }
 const app = new Hono<{ Bindings: Bindings }>()
-app.use('/api/*', cors())
+// NOTE: no cors() — same-origin only. The API refuses cross-origin browsers by default.
+
+// ============ SERVER CLOCK (single source of truth) ============
+// The commander's timezone is captured ONCE (settings.timezone). After that the
+// SERVER derives date+time — the client can never time-travel the engines.
+async function getSetting(DB: D1Database, key: string): Promise<string | null> {
+  const r = await DB.prepare(`SELECT value FROM settings WHERE key=?`).bind(key).first<{ value: string }>()
+  return r?.value ?? null
+}
+async function setSetting(DB: D1Database, key: string, value: string) {
+  await DB.prepare(`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+    .bind(key, value).run()
+}
+async function userNow(DB: D1Database): Promise<{ date: string; time: string; tz: string }> {
+  const tz = (await getSetting(DB, 'timezone')) || 'Africa/Nairobi'
+  const now = new Date()
+  let date: string, time: string
+  try {
+    date = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now)
+    time = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(now)
+  } catch (_) {
+    date = now.toISOString().slice(0, 10); time = now.toISOString().slice(11, 16)
+  }
+  if (time.startsWith('24')) time = '00' + time.slice(2)
+  return { date, time, tz }
+}
+
+// ============ AUTH (session cookie, HMAC-signed; password PBKDF2) ============
+const enc = new TextEncoder()
+function bufToHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+function randHex(n = 32): string {
+  const a = new Uint8Array(n); crypto.getRandomValues(a)
+  return [...a].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+async function pbkdf2(password: string, saltHex: string): Promise<string> {
+  const salt = new Uint8Array(saltHex.match(/.{2}/g)!.map(h => parseInt(h, 16)))
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits'])
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256)
+  return bufToHex(bits)
+}
+async function hmacSign(msg: string, secretHex: string): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', enc.encode(secretHex), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  return bufToHex(await crypto.subtle.sign('HMAC', key, enc.encode(msg)))
+}
+function timingSafeEq(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let r = 0
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return r === 0
+}
+async function sessionValid(c: any): Promise<boolean> {
+  const raw = getCookie(c, 'wr_session')
+  if (!raw) return false
+  const secret = await getSetting(c.env.DB, 'session_secret')
+  if (!secret) return false
+  const dot = raw.lastIndexOf('.')
+  if (dot < 1) return false
+  const exp = raw.slice(0, dot), sig = raw.slice(dot + 1)
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false
+  return timingSafeEq(await hmacSign(exp, secret), sig)
+}
+async function issueSession(c: any) {
+  let secret = await getSetting(c.env.DB, 'session_secret')
+  if (!secret) { secret = randHex(32); await setSetting(c.env.DB, 'session_secret', secret) }
+  const exp = String(Date.now() + 30 * 24 * 3600 * 1000) // 30 days
+  const sig = await hmacSign(exp, secret)
+  setCookie(c, 'wr_session', `${exp}.${sig}`, {
+    httpOnly: true, sameSite: 'Strict', secure: true, path: '/', maxAge: 30 * 24 * 3600
+  })
+}
+
+// -- auth endpoints (the ONLY unauthenticated API surface) --
+app.get('/api/auth/status', async (c) => {
+  const hasPass = !!(await getSetting(c.env.DB, 'auth_hash'))
+  return c.json({ setup: hasPass, authed: hasPass ? await sessionValid(c) : false })
+})
+app.post('/api/auth/setup', async (c) => {
+  const DB = c.env.DB
+  if (await getSetting(DB, 'auth_hash')) return c.json({ error: 'Already set up. Log in.' }, 400)
+  const { password } = await c.req.json()
+  if (!password || password.length < 8) return c.json({ error: 'Password must be at least 8 characters. This gate protects everything.' }, 400)
+  const salt = randHex(16)
+  const hash = await pbkdf2(password, salt)
+  await DB.batch([
+    DB.prepare(`INSERT INTO settings (key,value) VALUES ('auth_salt',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).bind(salt),
+    DB.prepare(`INSERT INTO settings (key,value) VALUES ('auth_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).bind(hash),
+  ])
+  await issueSession(c)
+  return c.json({ ok: true })
+})
+app.post('/api/auth/login', async (c) => {
+  const DB = c.env.DB
+  const hash = await getSetting(DB, 'auth_hash'), salt = await getSetting(DB, 'auth_salt')
+  if (!hash || !salt) return c.json({ error: 'Not set up yet.', setup: false }, 400)
+  // brute-force throttle: 5 fails → 15-minute lockout
+  const failsRaw = await getSetting(DB, 'auth_fails')
+  const [nFails, lastFail] = (failsRaw || '0,0').split(',').map(Number)
+  if (nFails >= 5 && Date.now() - lastFail < 15 * 60 * 1000) {
+    return c.json({ error: 'GATE SEALED. Too many failed attempts — wait 15 minutes. Patience is also discipline.' }, 429)
+  }
+  const { password } = await c.req.json()
+  const attempt = await pbkdf2(password || '', salt)
+  if (!timingSafeEq(attempt, hash)) {
+    await setSetting(DB, 'auth_fails', `${(Date.now() - lastFail < 15 * 60 * 1000 ? nFails : 0) + 1},${Date.now()}`)
+    return c.json({ error: 'Wrong password.' }, 401)
+  }
+  await setSetting(DB, 'auth_fails', '0,0')
+  await issueSession(c)
+  return c.json({ ok: true })
+})
+app.post('/api/auth/logout', async (c) => {
+  deleteCookie(c, 'wr_session', { path: '/' })
+  return c.json({ ok: true })
+})
+
+// -- global API guard --
+// /api/auth/*            → open (it IS the gate)
+// /api/agent/token*      → session only (UI shows/rotates the token for Termux setup)
+// /api/agent/*           → X-Agent-Token ONLY (checked in each handler via agentAuthed)
+// everything else /api/* → session cookie required
+app.use('/api/*', async (c, next) => {
+  const p = new URL(c.req.url).pathname
+  if (p.startsWith('/api/auth/')) return next()
+  if (p === '/api/agent/token' || p === '/api/agent/token/rotate') {
+    if (!(await sessionValid(c))) return c.json({ error: 'AUTH REQUIRED' }, 401)
+    return next()
+  }
+  if (p.startsWith('/api/agent/')) return next() // per-handler agent-token check (401 inside)
+  if (!(await sessionValid(c))) return c.json({ error: 'AUTH REQUIRED' }, 401)
+  return next()
+})
 
 const DOWS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
 
@@ -28,44 +160,92 @@ async function blocksForDate(DB: D1Database, date: string) {
   return results as any[]
 }
 
+// WEIGHTED ADHERENCE — CORE(3) / STANDARD(1) / CONTEXT(0).
+// adherence = Σ(weight × credit) / Σ(weight) over non-zero-weight blocks.
+// Missing a meal no longer equals missing deep work. Context blocks are
+// visible but unscored and unpenalized.
 function dayAdherence(blocks: any[]) {
-  if (!blocks.length) return { pct: 100, done: 0, total: 0 }
-  let score = 0
-  for (const b of blocks) {
-    if (b.log_status === 'done') score += 1
-    else if (b.log_status === 'partial') score += 0.5
+  const scored = blocks.filter((b: any) => (b.weight ?? 1) > 0)
+  if (!scored.length) return { pct: 100, done: 0, total: 0, wScore: 0, wTotal: 0, mvdHeld: false, mvdTotal: 0, mvdDone: 0 }
+  let wScore = 0, wTotal = 0, done = 0
+  for (const b of scored) {
+    const w = b.weight ?? 1
+    wTotal += w
+    if (b.log_status === 'done') { wScore += w; done += 1 }
+    else if (b.log_status === 'partial') { wScore += w * 0.5; done += 0.5 }
   }
-  return { pct: Math.round((score / blocks.length) * 100), done: score, total: blocks.length }
+  // MINIMUM VIABLE DAY: nominated CORE blocks — all hit ⇒ HELD THE LINE
+  const mvd = blocks.filter((b: any) => b.is_mvd)
+  const mvdDone = mvd.filter((b: any) => b.log_status === 'done' || b.log_status === 'partial').length
+  const mvdHeld = mvd.length > 0 && mvdDone === mvd.length
+  return {
+    pct: Math.round((wScore / wTotal) * 100), done, total: scored.length,
+    wScore, wTotal, mvdHeld, mvdTotal: mvd.length, mvdDone
+  }
 }
 
-async function flagExists(DB: D1Database, date: string, type: string, msgLike?: string) {
-  const q = msgLike
-    ? DB.prepare(`SELECT id FROM honesty_flags WHERE flag_date=? AND flag_type=? AND message LIKE ?`).bind(date, type, `%${msgLike}%`)
-    : DB.prepare(`SELECT id FROM honesty_flags WHERE flag_date=? AND flag_type=?`).bind(date, type)
+// Structured flag identity — no more message-LIKE matching.
+async function flagExists(DB: D1Database, date: string, type: string, refType?: string, refId?: number) {
+  const q = refType
+    ? DB.prepare(`SELECT id FROM honesty_flags WHERE flag_date=? AND flag_type=? AND ref_type=? AND ref_id=?`).bind(date, type, refType, refId ?? 0)
+    : DB.prepare(`SELECT id FROM honesty_flags WHERE flag_date=? AND flag_type=? AND ref_type IS NULL`).bind(date, type)
   return !!(await q.first())
 }
 
-async function addFlag(DB: D1Database, date: string, type: string, severity: string, message: string, penalty: number) {
-  await DB.prepare(`INSERT INTO honesty_flags (flag_date, flag_type, severity, message) VALUES (?,?,?,?)`)
-    .bind(date, type, severity, message).run()
-  if (penalty !== 0) {
-    await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
-      .bind(date, penalty, message, 'flag').run()
+// Race-safe flag+penalty: the UNIQUE identity index means INSERT OR IGNORE is the
+// arbiter — the penalty is written ONLY when the flag row was actually inserted.
+async function addFlag(DB: D1Database, date: string, type: string, severity: string, message: string, penalty: number, refType?: string, refId?: number) {
+  const ins = await DB.prepare(
+    `INSERT OR IGNORE INTO honesty_flags (flag_date, flag_type, severity, message, ref_type, ref_id) VALUES (?,?,?,?,?,?)`
+  ).bind(date, type, severity, message, refType ?? null, refId ?? null).run()
+  if (penalty !== 0 && (ins.meta as any).changes > 0) {
+    await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+      .bind(date, penalty, message, 'flag', refId ?? null).run()
   }
+  return (ins.meta as any).changes > 0
+}
+
+// ============ DAY SUMMARY (materialized — one row per day) ============
+// Written whenever a past day is processed; makes streak/stats O(1) reads.
+async function writeDaySummary(DB: D1Database, date: string, finalize = false) {
+  const blocks = await blocksForDate(DB, date)
+  const adh = dayAdherence(blocks)
+  const deb = await DB.prepare(`SELECT id FROM debriefs WHERE log_date=?`).bind(date).first()
+  const pts = await DB.prepare(`SELECT COALESCE(SUM(points),0) t FROM points_ledger WHERE log_date=?`).bind(date).first<any>()
+  // Victory = 80%+ weighted adherence with debrief. MVD held alone keeps the
+  // streak ALIVE (survival), it does not count as a victory day.
+  const victory = blocks.length > 0 && adh.pct >= 80 && !!deb
+  const survives = victory || adh.mvdHeld
+  await DB.prepare(
+    `INSERT INTO day_summary (summary_date, adherence_pct, weighted_score, weighted_total, blocks_done, blocks_total,
+       mvd_held, debrief_filed, victory, points, finalized, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
+     ON CONFLICT(summary_date) DO UPDATE SET adherence_pct=excluded.adherence_pct,
+       weighted_score=excluded.weighted_score, weighted_total=excluded.weighted_total,
+       blocks_done=excluded.blocks_done, blocks_total=excluded.blocks_total,
+       mvd_held=excluded.mvd_held, debrief_filed=excluded.debrief_filed,
+       victory=excluded.victory, points=excluded.points,
+       finalized=MAX(day_summary.finalized, excluded.finalized), updated_at=datetime('now')`
+  ).bind(date, adh.pct, adh.wScore, adh.wTotal, Math.round(adh.done), adh.total,
+    adh.mvdHeld ? 1 : 0, deb ? 1 : 0, victory ? 1 : 0, pts?.t ?? 0, finalize ? 1 : 0).run()
+  return { adh, deb: !!deb, victory, survives }
 }
 
 // ============ HONESTY ENGINE ============
-// Runs against yesterday (and the day before for never-miss-twice) each time state is loaded.
+// Runs against yesterday (and the day before) — ONLY from POST /api/tick, never on reads.
 async function runHonestyEngine(DB: D1Database, today: string) {
-  const start = await DB.prepare(`SELECT value FROM settings WHERE key='start_date'`).first<{ value: string }>()
-  const startDate = start?.value || today
+  const startDate = (await getSetting(DB, 'start_date')) || today
   const y1 = addDays(today, -1)
   const y2 = addDays(today, -2)
   if (y1 < startDate) return
 
+  // Skip if yesterday is already finalized (engine idempotence, saves ~10 queries/req)
+  const done = await DB.prepare(`SELECT finalized FROM day_summary WHERE summary_date=?`).bind(y1).first<any>()
+  const alreadyFinal = !!done?.finalized
+
   // 1. Missed debrief
   const deb = await DB.prepare(`SELECT id FROM debriefs WHERE log_date=?`).bind(y1).first()
-  if (!deb && !(await flagExists(DB, y1, 'missed_debrief'))) {
+  if (!deb) {
     await addFlag(DB, y1, 'missed_debrief', 'serious',
       `NIGHT DEBRIEF MISSED (${y1}). Law 5: Track, don't trust. An army without intelligence reports is blind. -15 pts. Write a catch-up debrief now.`, -15)
   }
@@ -73,77 +253,115 @@ async function runHonestyEngine(DB: D1Database, today: string) {
   // 2. Missed non-negotiable blocks yesterday
   // (skip 'missed' — those were already punished LIVE by the same-day enforcement engine)
   const yBlocks = await blocksForDate(DB, y1)
-  for (const b of yBlocks) {
-    if (b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial' && b.log_status !== 'missed') {
-      if (!(await flagExists(DB, y1, 'missed_block', `#${b.id}]`))) {
+  const adh = dayAdherence(yBlocks)
+  if (!alreadyFinal) {
+    for (const b of yBlocks) {
+      if (b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial' && b.log_status !== 'missed') {
         const skipped = b.log_status === 'skipped'
         await addFlag(DB, y1, 'missed_block', skipped ? 'warn' : 'serious',
           `[Block #${b.id}] NON-NEGOTIABLE ${skipped ? 'SKIPPED' : 'UNLOGGED'}: "${b.title}" (${y1}). ${skipped ? 'You were honest about it — logged, no ambush. -5 pts.' : 'Not even logged. Silence is the worst report. -10 pts.'}`,
-          skipped ? -5 : -10)
+          skipped ? -5 : -10, 'block', b.id)
       }
     }
-  }
 
-  // 3. Never miss twice (Law 2)
-  if (y2 >= startDate) {
-    const y2Blocks = await blocksForDate(DB, y2)
-    const missY2 = new Set(y2Blocks.filter((b: any) => b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial').map((b: any) => b.id))
-    for (const b of yBlocks) {
-      if (b.is_non_negotiable && missY2.has(b.id) && b.log_status !== 'done' && b.log_status !== 'partial') {
-        if (!(await flagExists(DB, y1, 'never_miss_twice', `#${b.id}]`))) {
-          await addFlag(DB, y1, 'never_miss_twice', 'critical',
-            `[Block #${b.id}] LAW 2 BROKEN: "${b.title}" missed TWO days straight (${y2}, ${y1}). This is the beginning of the end — unless you kill it today. -25 pts. Today this block is your #1 priority.`, -25)
+    // 3. LOAD REDUCTION (never-miss-twice INVERTED — review Tier-1 #3).
+    // Two straight misses = the schedule was wrong, not just the will.
+    // Response: HALVE the block for 3 days + demand the WHY. No extra penalty stack.
+    if (y2 >= startDate) {
+      const y2Blocks = await blocksForDate(DB, y2)
+      const missY2 = new Set(y2Blocks.filter((b: any) => b.is_non_negotiable && b.log_status !== 'done' && b.log_status !== 'partial').map((b: any) => b.id))
+      for (const b of yBlocks) {
+        if (b.is_non_negotiable && missY2.has(b.id) && b.log_status !== 'done' && b.log_status !== 'partial') {
+          const created = await addFlag(DB, y1, 'load_reduction', 'serious',
+            `[Block #${b.id}] TWO MISSES IN A ROW: "${b.title}" (${y2}, ${y1}). The block is now UNDER LOAD REDUCTION — half duration for 3 days. A plan that keeps breaking is a bad plan or a hidden refusal. Answer the why: wrong time? too long? wrong prerequisite? or you don't actually want it?`,
+            0, 'block', b.id)
+          if (created) {
+            await DB.prepare(
+              `INSERT OR IGNORE INTO load_reductions (block_id, start_date, end_date) VALUES (?,?,?)`
+            ).bind(b.id, today, addDays(today, 2)).run()
+          }
         }
       }
     }
-  }
 
-  // 3.5 TONGUE NEGLECT — drills piling up unreviewed means the armory is rotting
-  try {
-    const overdue = await DB.prepare(
-      `SELECT COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id
-       WHERE r.archived=0 AND s.due_date <= ?`
-    ).bind(addDays(today, -3)).first<any>()
-    if ((overdue?.n ?? 0) >= 5 && !(await flagExists(DB, y1, 'tongue_neglect'))) {
-      await addFlag(DB, y1, 'tongue_neglect', 'serious',
-        `TONGUE NEGLECT: ${overdue.n} wise responses are 3+ days overdue for drilling. You recorded wisdom and let it rot — a full armory you never trained with. -10 pts. Drill them today.`, -10)
+    // 3.5 TONGUE NEGLECT — drills piling up unreviewed means the armory is rotting
+    try {
+      const overdue = await DB.prepare(
+        `SELECT COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id
+         WHERE r.archived=0 AND s.due_date <= ?`
+      ).bind(addDays(today, -3)).first<any>()
+      if ((overdue?.n ?? 0) >= 5) {
+        await addFlag(DB, y1, 'tongue_neglect', 'serious',
+          `TONGUE NEGLECT: ${overdue.n} wise responses are 3+ days overdue for drilling. You recorded wisdom and let it rot — a full armory you never trained with. -10 pts. Drill them today.`, -10)
+      }
+    } catch (_) { /* table may not exist pre-migration */ }
+
+    // 4. Collapse day — but a HELD LINE (MVD) is NOT a collapse. Survival counts.
+    if (yBlocks.length > 0 && adh.pct < 50 && !adh.mvdHeld) {
+      await addFlag(DB, y1, 'low_adherence', 'serious',
+        `ADHERENCE COLLAPSE: ${adh.pct}% on ${y1} (target: 80%). No shame — but no lies either. Read your debrief, find the breach point, patch the wall. -10 pts.`, -10)
     }
-  } catch (_) { /* table may not exist pre-migration */ }
 
-  // 4. Low adherence day
-  const adh = dayAdherence(yBlocks)
-  if (yBlocks.length > 0 && adh.pct < 50 && !(await flagExists(DB, y1, 'low_adherence'))) {
-    await addFlag(DB, y1, 'low_adherence', 'serious',
-      `ADHERENCE COLLAPSE: ${adh.pct}% on ${y1} (target: 80%). No shame — but no lies either. Read your debrief, find the breach point, patch the wall. -10 pts.`, -10)
-  }
+    // 4.5 MVD HELD on a hard day — the line held. Small positive, streak survives.
+    if (yBlocks.length > 0 && adh.mvdHeld && adh.pct < 80) {
+      const already = await DB.prepare(`SELECT id FROM points_ledger WHERE log_date=? AND ref_type='mvd'`).bind(y1).first()
+      if (!already) {
+        await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
+          .bind(y1, 10, `HELD THE LINE: all ${adh.mvdTotal} core blocks hit on a hard day (${y1}). The streak lives. +10 pts.`, 'mvd').run()
+      }
+    }
 
-  // 5. Reward: 80%+ day with debrief = streak day bonus
-  if (yBlocks.length > 0 && adh.pct >= 80 && deb) {
-    const already = await DB.prepare(`SELECT id FROM points_ledger WHERE log_date=? AND ref_type='streak'`).bind(y1).first()
-    if (!already) {
-      await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
-        .bind(y1, 30, `VICTORY DAY: ${adh.pct}% adherence + debrief filed (${y1}). +30 pts.`, 'streak').run()
+    // 5. Victory: 80%+ weighted day with debrief
+    if (yBlocks.length > 0 && adh.pct >= 80 && deb) {
+      const already = await DB.prepare(`SELECT id FROM points_ledger WHERE log_date=? AND ref_type='streak'`).bind(y1).first()
+      if (!already) {
+        await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
+          .bind(y1, 30, `VICTORY DAY: ${adh.pct}% adherence + debrief filed (${y1}). +30 pts.`, 'streak').run()
+      }
     }
   }
+
+  // 6. Materialize + FINALIZE yesterday (immutable close of books)
+  await writeDaySummary(DB, y1, true)
 }
 
+// O(1) STREAK from day_summary. A day extends the streak if victory=1;
+// mvd_held=1 lets the streak SURVIVE (day is neutral, not a break).
 async function computeStreak(DB: D1Database, today: string): Promise<number> {
-  const start = await DB.prepare(`SELECT value FROM settings WHERE key='start_date'`).first<{ value: string }>()
-  const startDate = start?.value || today
+  const startDate = (await getSetting(DB, 'start_date')) || today
+  const { results } = await DB.prepare(
+    `SELECT summary_date, victory, mvd_held FROM day_summary
+     WHERE summary_date < ? AND summary_date >= ? ORDER BY summary_date DESC LIMIT 180`
+  ).bind(today, startDate).all()
+  const byDate = new Map((results as any[]).map(r => [r.summary_date, r]))
   let streak = 0
   let d = addDays(today, -1)
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 180; i++) {
     if (d < startDate) break
-    const blocks = await blocksForDate(DB, d)
-    const deb = await DB.prepare(`SELECT id FROM debriefs WHERE log_date=?`).bind(d).first()
-    const adh = dayAdherence(blocks)
-    if (deb && adh.pct >= 80) { streak++; d = addDays(d, -1) } else break
+    const r = byDate.get(d)
+    if (r?.victory) streak++
+    else if (r?.mvd_held) { /* survives, contributes nothing */ }
+    else break
+    d = addDays(d, -1)
   }
-  // today counts if already qualifying
+  // today counts live if already qualifying
   const tBlocks = await blocksForDate(DB, today)
   const tDeb = await DB.prepare(`SELECT id FROM debriefs WHERE log_date=?`).bind(today).first()
   if (tDeb && dayAdherence(tBlocks).pct >= 80) streak++
   return streak
+}
+
+// DELTA SCORING — today vs your trailing 14-day median (review Tier-1 #4).
+// The fixed 80% stays visible as the horizon; the fight is vs yesterday's self.
+async function trailingMedian(DB: D1Database, today: string): Promise<number | null> {
+  const { results } = await DB.prepare(
+    `SELECT adherence_pct FROM day_summary WHERE summary_date < ? AND summary_date >= ? AND blocks_total > 0
+     ORDER BY summary_date DESC LIMIT 14`
+  ).bind(today, addDays(today, -14)).all()
+  const v = (results as any[]).map(r => r.adherence_pct).sort((a, b) => a - b)
+  if (v.length < 3) return null // not enough history to be honest about a median
+  const mid = Math.floor(v.length / 2)
+  return v.length % 2 ? v[mid] : Math.round((v[mid - 1] + v[mid]) / 2)
 }
 
 // ============ SAME-DAY ENFORCEMENT (real-time honesty — no free passes) ============
@@ -172,24 +390,20 @@ async function runSameDayEnforcement(DB: D1Database, date: string, time: string)
        WHERE block_logs.status='pending'`
     ).bind(b.id, date, 'missed', `AUTO-CANCELED: window closed unlogged at ${time} (grace ${grace}m).`).run()
     const nn = !!b.is_non_negotiable
+    const w = b.weight ?? 1
+    // CONTEXT blocks (weight 0) are unscored AND unpenalized — canceled silently.
+    if (w === 0) continue
     const penalty = nn ? -15 : -5
-    if (!(await flagExists(DB, date, 'missed_live', `#${b.id}]`))) {
-      await addFlag(DB, date, 'missed_live', nn ? 'critical' : 'warn',
-        `[Block #${b.id}] ${nn ? 'NON-NEGOTIABLE ' : ''}MISSED — CANCELED: "${b.title}" (${b.start_time}–${b.end_time}) ended unlogged. The window is closed. ${penalty} pts. It cannot be reopened — never miss twice.`,
-        penalty)
-    }
+    await addFlag(DB, date, 'missed_live', nn ? 'critical' : 'warn',
+      `[Block #${b.id}] ${nn ? 'NON-NEGOTIABLE ' : ''}MISSED — CANCELED: "${b.title}" (${b.start_time}–${b.end_time}) ended unlogged. The window is closed. ${penalty} pts. One appeal token per week can reopen a window — at the cost of a written, permanent reason.`,
+      penalty, 'block', b.id)
   }
 }
 
-// ============ STATE (the war room heartbeat) ============
-app.get('/api/state', async (c) => {
-  const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
-  const time = c.req.query('time') || '12:00'
-
-  await runHonestyEngine(DB, date)
-  await runSameDayEnforcement(DB, date, time)
-
+// ============ STATE (read-only heartbeat) + TICK (the engine crank) ============
+// GET /api/state no longer mutates anything — engines run ONLY via POST /api/tick,
+// with the SERVER's clock. A client can no longer time-travel penalties into existence.
+async function buildState(DB: D1Database, date: string, time: string) {
   const blocks = await blocksForDate(DB, date)
   const current = blocks.find((b: any) => b.start_time <= time && time < b.end_time) || null
   const next = blocks.find((b: any) => b.start_time > time) || null
@@ -213,13 +427,61 @@ app.get('/api/state', async (c) => {
      WHERE up.status NOT IN ('locked','complete') ORDER BY p.sort_order, u.sort_order`
   ).all()).results
 
-  return c.json({
+  // delta scoring vs trailing 14-day median + appeal availability + active load reductions
+  const median = await trailingMedian(DB, date)
+  const weekKey = isoWeekKey(date)
+  const appealUsed = await DB.prepare(`SELECT id FROM appeals WHERE week_key=?`).bind(weekKey).first()
+  const loadReductions = (await DB.prepare(
+    `SELECT lr.*, b.title FROM load_reductions lr JOIN schedule_blocks b ON b.id=lr.block_id
+     WHERE lr.end_date >= ? ORDER BY lr.start_date DESC`
+  ).bind(date).all().catch(() => ({ results: [] as any[] }))).results
+  const openPredictions = await DB.prepare(
+    `SELECT COUNT(*) n FROM predictions WHERE outcome='unresolved' AND resolve_by <= ?`
+  ).bind(date).first<any>().catch(() => ({ n: 0 }))
+
+  return {
     date, time, blocks, current, next, adherence: adh, streak,
     points: pts?.total ?? 0, todayPoints: todayPts?.total ?? 0,
     flags, debrief, debriefDoneToday: !!debrief,
     yesterdayTargets: (yDebrief as any)?.tomorrow_targets || null,
-    dueCards: dueCards?.n ?? 0, dueTongue: (dueTongue as any)?.n ?? 0, activeUnits
-  })
+    dueCards: dueCards?.n ?? 0, dueTongue: (dueTongue as any)?.n ?? 0, activeUnits,
+    median, delta: median === null ? null : adh.pct - median,
+    appealAvailable: !appealUsed, loadReductions,
+    duePredictions: (openPredictions as any)?.n ?? 0
+  }
+}
+
+function isoWeekKey(dateStr: string): string {
+  const d = new Date(dateStr + 'T12:00:00Z')
+  const day = (d.getUTCDay() + 6) % 7
+  d.setUTCDate(d.getUTCDate() - day + 3) // Thursday of this week
+  const y = d.getUTCFullYear()
+  const jan4 = new Date(Date.UTC(y, 0, 4))
+  const week = 1 + Math.round(((d.getTime() - jan4.getTime()) / 86400000 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7)
+  return `${y}-W${String(week).padStart(2, '0')}`
+}
+
+// READ — no side effects, ever. Server clock, client clock ignored.
+app.get('/api/state', async (c) => {
+  const { date, time } = await userNow(c.env.DB)
+  return c.json(await buildState(c.env.DB, date, time))
+})
+
+// CRANK — the ONLY place engines run. Server-derived date/time; future dates impossible.
+app.post('/api/tick', async (c) => {
+  const DB = c.env.DB
+  // capture the commander's timezone once (first tick from the UI sends it)
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    if (body?.tz && !(await getSetting(DB, 'timezone_locked'))) {
+      try { new Intl.DateTimeFormat('en', { timeZone: body.tz }); await setSetting(DB, 'timezone', body.tz); await setSetting(DB, 'timezone_locked', '1') } catch (_) {}
+    }
+  } catch (_) {}
+  const { date, time } = await userNow(DB)
+  await runHonestyEngine(DB, date)
+  await runSameDayEnforcement(DB, date, time)
+  await writeDaySummary(DB, date, false) // keep today's row fresh (not finalized)
+  return c.json(await buildState(DB, date, time))
 })
 
 // ============ BLOCK LOGGING ============

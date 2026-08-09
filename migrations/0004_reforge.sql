@@ -12,10 +12,22 @@ ALTER TABLE schedule_blocks ADD COLUMN is_mvd INTEGER NOT NULL DEFAULT 0;
 --   non-negotiables -> CORE(3); meals/skincare/entertainment/sleep/rest/flex -> CONTEXT(0)
 UPDATE schedule_blocks SET weight = 3 WHERE is_non_negotiable = 1;
 UPDATE schedule_blocks SET weight = 0 WHERE category IN ('meal','skincare','entertainment','sleep','rest','flex');
+-- Default MVD nomination: the first 3 non-negotiable CORE blocks of the day
+UPDATE schedule_blocks SET is_mvd = 1 WHERE id IN (
+  SELECT id FROM schedule_blocks WHERE is_non_negotiable = 1 ORDER BY start_time, sort_order LIMIT 3
+);
 
 -- 2. Structured flag identity (kills message-LIKE dedup)
 ALTER TABLE honesty_flags ADD COLUMN ref_type TEXT;
 ALTER TABLE honesty_flags ADD COLUMN ref_id INTEGER;
+-- Backfill ref ids from legacy '[Block #N]' message prefixes
+UPDATE honesty_flags SET ref_type='block',
+  ref_id=CAST(substr(message, instr(message,'#')+1, instr(message,']')-instr(message,'#')-1) AS INTEGER)
+  WHERE message LIKE '[Block #%]%';
+-- Dedupe any residual identity collisions (keep oldest)
+DELETE FROM honesty_flags WHERE id NOT IN (
+  SELECT MIN(id) FROM honesty_flags GROUP BY flag_date, flag_type, COALESCE(ref_type,''), COALESCE(ref_id,0)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_flags_identity
   ON honesty_flags(flag_date, flag_type, COALESCE(ref_type,''), COALESCE(ref_id,0));
 
@@ -75,6 +87,6 @@ CREATE TABLE IF NOT EXISTS load_reductions (
   UNIQUE(block_id, start_date)
 );
 
--- 7. Settings: timezone + MVD defaults
-INSERT OR IGNORE INTO settings (key, value) VALUES ('timezone', 'Africa/Nairobi');
--- auth_hash / auth_salt / session_secret are created at runtime on first password setup
+-- 7. Settings: timezone is captured ONCE from the commander's device on first tick,
+--    then server-derived time is the only clock. auth_hash / auth_salt / session_secret
+--    are created at runtime on first password setup.
