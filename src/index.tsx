@@ -30,6 +30,13 @@ async function userNow(DB: D1Database): Promise<{ date: string; time: string; tz
   return { date, time, tz }
 }
 
+// Clamp any client-supplied date: valid format, never in the future.
+async function safeDate(DB: D1Database, q?: string | null): Promise<string> {
+  const { date: today } = await userNow(DB)
+  if (!q || !/^\d{4}-\d{2}-\d{2}$/.test(q)) return today
+  return q > today ? today : q
+}
+
 // ============ AUTH (session cookie, HMAC-signed; password PBKDF2) ============
 const enc = new TextEncoder()
 function bufToHex(buf: ArrayBuffer): string {
@@ -485,37 +492,167 @@ app.post('/api/tick', async (c) => {
 })
 
 // ============ BLOCK LOGGING ============
+// Date is SERVER-derived. You log the block you are living, not the day you wish.
 app.post('/api/blocks/:id/log', async (c) => {
   const DB = c.env.DB
   const id = Number(c.req.param('id'))
-  const { date, status, note } = await c.req.json()
+  const { status, note } = await c.req.json()
+  const { date } = await userNow(DB)
   const block = await DB.prepare(`SELECT * FROM schedule_blocks WHERE id=?`).bind(id).first<any>()
   if (!block) return c.json({ error: 'no such block' }, 404)
 
   const prev = await DB.prepare(`SELECT * FROM block_logs WHERE block_id=? AND log_date=?`).bind(id, date).first<any>()
   // THE WINDOW RULE: a block auto-canceled by the enforcement engine is CLOSED.
-  // You cannot rewrite history — the only exit is a formal appeal (which costs the truth).
+  // The only exit is the weekly appeal token (which costs a permanent written reason).
   if (prev && prev.status === 'missed') {
-    return c.json({ error: 'WINDOW CLOSED. "' + block.title + '" was auto-canceled unlogged — it cannot be reopened. The penalty stands. Win the next block.' }, 409)
+    return c.json({ error: 'WINDOW CLOSED. "' + block.title + '" was auto-canceled unlogged — it cannot be reopened. The penalty stands. One appeal token per week exists, if you can face writing the reason.' }, 409)
   }
-  await DB.prepare(
-    `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
-     ON CONFLICT(block_id, log_date) DO UPDATE SET status=excluded.status, note=excluded.note, completed_at=excluded.completed_at`
-  ).bind(id, date, status, note || null).run()
 
-  // points: only award once per block/day transition into done/partial
+  // atomic: log + points transition in one batch
+  const stmts: D1PreparedStatement[] = [
+    DB.prepare(
+      `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
+       ON CONFLICT(block_id, log_date) DO UPDATE SET status=excluded.status, note=excluded.note, completed_at=excluded.completed_at`
+    ).bind(id, date, status, note || null)
+  ]
   const prevEarned = prev && (prev.status === 'done' || prev.status === 'partial')
   const nowEarns = status === 'done' || status === 'partial'
   if (nowEarns && !prevEarned) {
     const p = status === 'done' ? block.points : Math.ceil(block.points / 2)
-    await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
-      .bind(date, p, `${status === 'done' ? 'Completed' : 'Partial'}: ${block.title} (+${p})`, 'block', id).run()
+    stmts.push(DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+      .bind(date, p, `${status === 'done' ? 'Completed' : 'Partial'}: ${block.title} (+${p})`, 'block', id))
   } else if (!nowEarns && prevEarned) {
     const p = prev.status === 'done' ? block.points : Math.ceil(block.points / 2)
-    await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
-      .bind(date, -p, `Reverted: ${block.title} (-${p})`, 'block', id).run()
+    stmts.push(DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+      .bind(date, -p, `Reverted: ${block.title} (-${p})`, 'block', id))
   }
+  await DB.batch(stmts)
+  await writeDaySummary(DB, date, false)
+  return c.json({ ok: true, date })
+})
+
+// ============ APPEALS — one token per week, permanent reason ============
+app.post('/api/appeals', async (c) => {
+  const DB = c.env.DB
+  const { block_id, block_date, reason } = await c.req.json()
+  const { date } = await userNow(DB)
+  if (!reason || String(reason).trim().length < 100) {
+    return c.json({ error: 'THE REASON IS THE PRICE. Write at least 100 characters explaining exactly what happened — this goes on the permanent record.' }, 400)
+  }
+  if (!block_id || !block_date) return c.json({ error: 'block_id and block_date required' }, 400)
+  if (block_date > date) return c.json({ error: 'Cannot appeal the future.' }, 400)
+  if (block_date < addDays(date, -7)) return c.json({ error: 'Too late. Appeals reach back 7 days at most — old wounds stay closed.' }, 400)
+  const log = await DB.prepare(`SELECT * FROM block_logs WHERE block_id=? AND log_date=?`).bind(block_id, block_date).first<any>()
+  if (!log || log.status !== 'missed') return c.json({ error: 'That block was not auto-canceled. Appeals only reopen closed windows.' }, 400)
+  const week = isoWeekKey(date)
+  // UNIQUE(week_key) makes this race-safe: the INSERT itself is the arbiter
+  const ins = await DB.prepare(
+    `INSERT OR IGNORE INTO appeals (appeal_date, block_id, block_date, reason, week_key) VALUES (?,?,?,?,?)`
+  ).bind(date, block_id, block_date, String(reason).trim(), week).run()
+  if ((ins.meta as any).changes === 0) {
+    return c.json({ error: 'APPEAL TOKEN SPENT. One per week — the next one arrives Monday.' }, 409)
+  }
+  // reopen the window: missed → pending, ack the flag, refund the penalty
+  const pen = await DB.prepare(
+    `SELECT COALESCE(SUM(points),0) p FROM points_ledger WHERE log_date=? AND ref_type='flag' AND ref_id=? AND points<0`
+  ).bind(block_date, block_id).first<any>()
+  const stmts: D1PreparedStatement[] = [
+    DB.prepare(`UPDATE block_logs SET status='pending', note='REOPENED BY APPEAL ('||?||')' WHERE block_id=? AND log_date=?`)
+      .bind(date, block_id, block_date),
+    DB.prepare(`UPDATE honesty_flags SET acknowledged=1 WHERE flag_date=? AND flag_type='missed_live' AND ref_type='block' AND ref_id=?`)
+      .bind(block_date, block_id),
+  ]
+  if ((pen?.p ?? 0) < 0) {
+    stmts.push(DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
+      .bind(date, -pen.p, `APPEAL GRANTED: penalty refunded for reopened window (block #${block_id}, ${block_date}). The reason is on the permanent record.`, 'appeal', block_id))
+  }
+  await DB.batch(stmts)
+  await writeDaySummary(DB, block_date, false)
+  return c.json({ ok: true, refunded: -(pen?.p ?? 0) })
+})
+app.get('/api/appeals', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT a.*, b.title FROM appeals a JOIN schedule_blocks b ON b.id=a.block_id ORDER BY a.created_at DESC LIMIT 50`
+  ).all()
+  return c.json(results)
+})
+
+// ============ LOAD REDUCTION — answer the why ============
+app.post('/api/load-reductions/:id/answer', async (c) => {
+  const { reason } = await c.req.json()
+  const ok = ['wrong_time', 'too_long', 'wrong_prereq', 'dont_want_it']
+  if (!ok.includes(reason)) return c.json({ error: 'Answer must be one of: wrong_time, too_long, wrong_prereq, dont_want_it' }, 400)
+  await c.env.DB.prepare(`UPDATE load_reductions SET reason=?, answered_at=datetime('now') WHERE id=?`)
+    .bind(reason, Number(c.req.param('id'))).run()
+  const advice: Record<string, string> = {
+    wrong_time: 'Then MOVE it. Edit the block to the hour your energy actually supports it.',
+    too_long: 'Then SHRINK it permanently. A 25-minute block done daily beats a 90-minute block done never.',
+    wrong_prereq: 'Then fix the pipeline. What has to exist before this block can succeed? Schedule THAT.',
+    dont_want_it: 'Then that is the real finding. Either recommit for a reason you actually believe, or delete it with honor. Zombie blocks corrupt the whole ledger.'
+  }
+  return c.json({ ok: true, advice: advice[reason] })
+})
+
+// ============ PREDICTION LOG — the calibration instrument ============
+app.post('/api/predictions', async (c) => {
+  const DB = c.env.DB
+  const { claim, confidence, resolve_by, domain } = await c.req.json()
+  const { date } = await userNow(DB)
+  if (!claim || String(claim).trim().length < 10) return c.json({ error: 'State the claim precisely — a vague prediction is unfalsifiable, which is the disease this log cures.' }, 400)
+  const conf = Number(confidence)
+  if (!Number.isFinite(conf) || conf < 50 || conf > 99) return c.json({ error: 'Confidence must be 50–99%. Below 50, state the opposite claim. 100 does not exist for mortals.' }, 400)
+  if (!resolve_by || resolve_by <= date) return c.json({ error: 'Resolution date must be in the future.' }, 400)
+  const r = await DB.prepare(
+    `INSERT INTO predictions (made_date, claim, confidence, resolve_by, domain) VALUES (?,?,?,?,?)`
+  ).bind(date, String(claim).trim(), conf, resolve_by, domain || null).run()
+  return c.json({ ok: true, id: r.meta.last_row_id })
+})
+app.get('/api/predictions', async (c) => {
+  const { results } = await c.env.DB.prepare(`SELECT * FROM predictions ORDER BY (outcome='unresolved') DESC, resolve_by ASC, id DESC LIMIT 200`).all()
+  return c.json(results)
+})
+app.post('/api/predictions/:id/resolve', async (c) => {
+  const DB = c.env.DB
+  const { outcome, note } = await c.req.json()
+  if (!['right', 'wrong', 'void'].includes(outcome)) return c.json({ error: 'Outcome: right, wrong, or void.' }, 400)
+  const { date } = await userNow(DB)
+  const p = await DB.prepare(`SELECT * FROM predictions WHERE id=?`).bind(Number(c.req.param('id'))).first<any>()
+  if (!p) return c.json({ error: 'not found' }, 404)
+  if (p.outcome !== 'unresolved') return c.json({ error: 'Already resolved. The record does not get rewritten.' }, 409)
+  await DB.prepare(`UPDATE predictions SET outcome=?, resolved_date=?, resolution_note=? WHERE id=?`)
+    .bind(outcome, date, note || null, p.id).run()
   return c.json({ ok: true })
+})
+// Calibration report: Brier score, bucketed curve, plain-language bias
+app.get('/api/predictions/calibration', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT confidence, outcome FROM predictions WHERE outcome IN ('right','wrong')`
+  ).all()
+  const rows = results as any[]
+  if (!rows.length) return c.json({ n: 0, brier: null, buckets: [], verdict: 'No resolved predictions yet. Make claims. Date them. Grade them.' })
+  let brier = 0
+  const buckets: Record<string, { n: number; hits: number; confSum: number }> = {}
+  for (const r of rows) {
+    const p = r.confidence / 100, hit = r.outcome === 'right' ? 1 : 0
+    brier += (p - hit) ** 2
+    const bk = r.confidence < 60 ? '50-59' : r.confidence < 70 ? '60-69' : r.confidence < 80 ? '70-79' : r.confidence < 90 ? '80-89' : '90-99'
+    ;(buckets[bk] ||= { n: 0, hits: 0, confSum: 0 })
+    buckets[bk].n++; buckets[bk].hits += hit; buckets[bk].confSum += r.confidence
+  }
+  brier = brier / rows.length
+  const curve = Object.entries(buckets).sort().map(([range, b]) => ({
+    range, n: b.n, avgConfidence: Math.round(b.confSum / b.n), hitRate: Math.round((b.hits / b.n) * 100)
+  }))
+  // plain-language bias statement
+  const gaps = curve.filter(b => b.n >= 3).map(b => b.avgConfidence - b.hitRate)
+  const avgGap = gaps.length ? Math.round(gaps.reduce((a, g) => a + g, 0) / gaps.length) : 0
+  let verdict: string
+  if (!gaps.length) verdict = `Only ${rows.length} graded predictions — grade at least 3 per bucket before trusting the curve.`
+  else if (avgGap >= 15) verdict = `OVERCONFIDENT by ~${avgGap} points: when you say ${curve[curve.length - 1].avgConfidence}%, reality delivers ${curve[curve.length - 1].hitRate}%. Your certainty is louder than your accuracy — shave ${avgGap} points off every gut number before acting on it.`
+  else if (avgGap >= 7) verdict = `Mildly overconfident (~${avgGap} pts). Decent, but when the stakes are high, treat your "sure" as "probably".`
+  else if (avgGap <= -10) verdict = `UNDERCONFIDENT by ~${-avgGap} points: you know more than you let yourself act on. Your hesitation is costing you moves you would have won.`
+  else verdict = `WELL CALIBRATED (gap ~${avgGap} pts, Brier ${brier.toFixed(3)}). Your stated confidence is close to reality — rare. Keep grading.`
+  return c.json({ n: rows.length, brier: Number(brier.toFixed(4)), buckets: curve, verdict })
 })
 
 // ============ DEBRIEF ============
@@ -598,7 +735,7 @@ app.post('/api/units/:id/step', async (c) => {
   const unit = await DB.prepare(`SELECT * FROM units WHERE id=?`).bind(id).first<any>()
   if (!up || !unit) return c.json({ error: 'not found' }, 404)
   if (up.status === 'locked') return c.json({ error: 'UNIT LOCKED. Finish the previous unit first — this system is progress-based, no skipping.' }, 400)
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
 
   if (step === 'reading') {
     await DB.prepare(`UPDATE unit_progress SET status='reading_done', reading_done_at=datetime('now') WHERE unit_id=?`).bind(id).run()
@@ -667,7 +804,7 @@ async function ensureCards(DB: D1Database) {
 app.get('/api/cards/due', async (c) => {
   const DB = c.env.DB
   await ensureCards(DB)
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const date = await safeDate(c.env.DB, c.req.query('date'))
   const { results } = await DB.prepare(
     `SELECT f.*, m.source, m.principle, m.naive_reading, m.master_reading, m.my_words
      FROM flashcards f JOIN maxims m ON m.id=f.maxim_id WHERE f.due_date <= ? ORDER BY f.due_date LIMIT 15`
@@ -689,7 +826,7 @@ app.post('/api/cards/:maximId/review', async (c) => {
     else if (reps === 2) interval_days = 3
     else interval_days = Math.round(interval_days * ease * (grade === 1 ? 0.8 : grade === 3 ? 1.3 : 1))
   }
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
   const due = addDays(today, Math.max(interval_days, grade === 0 ? 0 : 1))
   await DB.prepare(`UPDATE flashcards SET interval_days=?, ease=?, reps=?, lapses=?, due_date=? WHERE maxim_id=?`)
     .bind(interval_days, ease, reps, lapses, due, mid).run()
@@ -725,7 +862,7 @@ app.post('/api/tongue', async (c) => {
   const { situation, trigger_q, response, why_works, source, category } = await c.req.json()
   if (!situation?.trim() || !trigger_q?.trim() || !response?.trim())
     return c.json({ error: 'Situation, the question, and the exact response are all required. Record it fully or it is lost.' }, 400)
-  const today = new Date().toISOString().slice(0, 10)
+  const today = (await userNow(c.env.DB)).date
   const r = await DB.prepare(
     `INSERT INTO responses (situation, trigger_q, response, why_works, source, category) VALUES (?,?,?,?,?,?)`
   ).bind(situation.trim(), trigger_q.trim(), response.trim(), (why_works || '').trim() || null, (source || '').trim() || null, category || 'wit').run()
@@ -768,7 +905,7 @@ app.delete('/api/tongue/:id', async (c) => {
 // brain is attacked from 5 angles: recall / cloze / first_letters / reverse / delivery
 app.get('/api/tongue/due', async (c) => {
   const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const date = await safeDate(c.env.DB, c.req.query('date'))
   const { results } = await DB.prepare(
     `SELECT r.*, s.mastery, s.due_date, s.reps, s.lapses, s.interval_days, s.total_reviews, s.correct_reviews, s.last_mode
      FROM responses r JOIN response_srs s ON s.response_id=r.id
@@ -802,7 +939,7 @@ app.post('/api/tongue/:id/review', async (c) => {
     else if (reps === 2) interval_days = 3
     else interval_days = Math.round(interval_days * ease * (grade === 1 ? 0.8 : grade === 3 ? 1.3 : 1))
   }
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
   const due = addDays(today, Math.max(interval_days, grade === 0 ? 0 : 1))
   const mastery = tongueMastery({ correct_reviews, interval_days })
   const prevMastery = s.mastery
@@ -838,7 +975,7 @@ app.get('/api/tongue/exam', async (c) => {
 app.post('/api/tongue/exam/submit', async (c) => {
   const DB = c.env.DB
   const { total, correct, date } = await c.req.json()
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
   const pct = total ? Math.round((correct / total) * 100) : 0
   const passed = pct >= 80 ? 1 : 0
   await DB.prepare(`INSERT INTO tongue_exams (exam_date, total, correct, score_pct, passed) VALUES (?,?,?,?,?)`)
@@ -856,7 +993,7 @@ app.post('/api/tongue/exam/submit', async (c) => {
 // Tongue stats — the real-progress dashboard
 app.get('/api/tongue/stats', async (c) => {
   const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const date = await safeDate(c.env.DB, c.req.query('date'))
   const byMastery = (await DB.prepare(
     `SELECT s.mastery, COUNT(*) n FROM response_srs s JOIN responses r ON r.id=s.response_id WHERE r.archived=0 GROUP BY s.mastery`
   ).all()).results
@@ -883,7 +1020,7 @@ app.get('/api/tongue/stats', async (c) => {
 
 // ============ LAWS ============
 app.get('/api/laws', async (c) => {
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
+  const date = await safeDate(c.env.DB, c.req.query('date'))
   const { results } = await c.env.DB.prepare(
     `SELECT l.*, lc.kept, lc.note FROM laws l LEFT JOIN law_checks lc ON lc.law_id=l.id AND lc.log_date=? ORDER BY l.sort_order`
   ).bind(date).all()
@@ -923,14 +1060,28 @@ app.post('/api/rewards/:id/redeem', async (c) => {
 // ============ STATS ============
 app.get('/api/stats', async (c) => {
   const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
-  const days = []
+  const date = await safeDate(c.env.DB, c.req.query('date'))
+  // 14-day strip straight from day_summary (2 queries, not 28+)
+  const from14 = addDays(date, -13)
+  const sumRows = (await DB.prepare(
+    `SELECT * FROM day_summary WHERE summary_date BETWEEN ? AND ?`
+  ).bind(from14, date).all()).results as any[]
+  const debRows = (await DB.prepare(
+    `SELECT log_date, sleep_hours, mood, energy FROM debriefs WHERE log_date BETWEEN ? AND ?`
+  ).bind(from14, date).all()).results as any[]
+  const sumBy = new Map(sumRows.map(r => [r.summary_date, r]))
+  const debBy = new Map(debRows.map(r => [r.log_date, r]))
+  const days = [] as any[]
   for (let i = 13; i >= 0; i--) {
     const d = addDays(date, -i)
-    const blocks = await blocksForDate(DB, d)
-    const adh = dayAdherence(blocks)
-    const deb = await DB.prepare(`SELECT sleep_hours, mood, energy FROM debriefs WHERE log_date=?`).bind(d).first<any>()
-    days.push({ date: d, pct: adh.pct, done: adh.done, total: adh.total, sleep: deb?.sleep_hours ?? null, mood: deb?.mood ?? null, energy: deb?.energy ?? null, debrief: !!deb })
+    const s = sumBy.get(d), deb = debBy.get(d)
+    // today (or an unmaterialized day) falls back to live computation once
+    let pct = s?.adherence_pct ?? null, done = s?.blocks_done ?? 0, total = s?.blocks_total ?? 0, mvd = !!s?.mvd_held
+    if (pct === null && d === date) {
+      const adh = dayAdherence(await blocksForDate(DB, d))
+      pct = adh.pct; done = Math.round(adh.done); total = adh.total; mvd = adh.mvdHeld
+    }
+    days.push({ date: d, pct: pct ?? 0, done, total, mvdHeld: mvd, sleep: deb?.sleep_hours ?? null, mood: deb?.mood ?? null, energy: deb?.energy ?? null, debrief: !!deb })
   }
   // category breakdown last 7 days
   const from = addDays(date, -6)
@@ -1004,11 +1155,11 @@ app.post('/api/intel', async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO intel_entries (log_date, domain, title, situation, my_move, outcome, verdict, principle_used, lesson, people)
      VALUES (?,?,?,?,?,?,?,?,?,?)`
-  ).bind(b.log_date || new Date().toISOString().slice(0, 10), b.domain, b.title, b.situation || null,
+  ).bind(b.log_date || (await userNow(c.env.DB)).date, b.domain, b.title, b.situation || null,
     b.my_move || null, b.outcome || null, b.verdict || 'pending', b.principle_used || null,
     b.lesson || null, b.people || null).run()
   await c.env.DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
-    .bind(b.log_date || new Date().toISOString().slice(0, 10), 15, `Intel filed: [${b.domain}] ${b.title} (+15)`, 'intel', r.meta.last_row_id).run()
+    .bind(b.log_date || (await userNow(c.env.DB)).date, 15, `Intel filed: [${b.domain}] ${b.title} (+15)`, 'intel', r.meta.last_row_id).run()
   return c.json({ ok: true, id: r.meta.last_row_id })
 })
 
@@ -1060,7 +1211,7 @@ app.post('/api/library/:bookId/chapter/:idx', async (c) => {
   ).bind(bookId, idx, status || 'reading', last_para ?? 0, notes || null, status || 'reading').run()
   if (status === 'done' && prev?.status !== 'done') {
     await c.env.DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
-      .bind(date || new Date().toISOString().slice(0, 10), 20, `Real chapter finished: ${bookId} ch.${idx + 1} (+20)`, 'book').run()
+      .bind(date || (await userNow(c.env.DB)).date, 20, `Real chapter finished: ${bookId} ch.${idx + 1} (+20)`, 'book').run()
   }
   return c.json({ ok: true })
 })
@@ -1140,7 +1291,7 @@ app.post('/api/hermes', async (c) => {
   const DB = c.env.DB
   const { message, date } = await c.req.json()
   if (!message?.trim()) return c.json({ error: 'Say something, Commander.' }, 400)
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
 
   const briefing = await hermesBriefing(DB, today)
   const history = ((await DB.prepare(`SELECT role, content FROM hermes_messages ORDER BY id DESC LIMIT 12`).all()).results as any[]).reverse()
@@ -1183,7 +1334,7 @@ app.get('/api/hermes/history', async (c) => {
 app.post('/api/hermes/council', async (c) => {
   const DB = c.env.DB
   const { date } = await c.req.json()
-  const today = date || new Date().toISOString().slice(0, 10)
+  const today = date || (await userNow(c.env.DB)).date
   const briefing = await hermesBriefing(DB, today)
   const apiKey = c.env.OPENAI_API_KEY
   if (!apiKey) return c.json({ error: 'Hermes offline: no LLM key.' }, 500)
@@ -1254,10 +1405,11 @@ async function getAgentToken(DB: D1Database): Promise<string> {
 }
 
 async function agentAuthed(c: any): Promise<boolean> {
-  const token = c.req.header('x-agent-token') || c.req.query('token')
+  // HEADER ONLY — tokens in query strings leak into logs and referrers.
+  const token = c.req.header('x-agent-token')
   if (!token) return false
   const stored = await getAgentToken(c.env.DB)
-  return token === stored
+  return timingSafeEq(token, stored)
 }
 
 // Called from the app UI (same-origin) to show/rotate the token
@@ -1274,11 +1426,9 @@ app.post('/api/agent/token/rotate', async (c) => {
 app.get('/api/agent/briefing', async (c) => {
   if (!(await agentAuthed(c))) return c.json({ error: 'Invalid agent token' }, 401)
   const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
-  await runHonestyEngine(DB, date)
+  const { date, time } = await userNow(DB) // server clock; reads never run engines
   const briefing = await hermesBriefing(DB, date)
   const blocks = await blocksForDate(DB, date)
-  const time = c.req.query('time') || '12:00'
   const current = blocks.find((b: any) => b.start_time <= time && time < b.end_time) || null
   const next = blocks.find((b: any) => b.start_time > time) || null
   const flags = (await DB.prepare(`SELECT * FROM honesty_flags WHERE acknowledged=0`).all()).results
@@ -1289,9 +1439,7 @@ app.get('/api/agent/briefing', async (c) => {
 app.get('/api/agent/pending', async (c) => {
   if (!(await agentAuthed(c))) return c.json({ error: 'Invalid agent token' }, 401)
   const DB = c.env.DB
-  const date = c.req.query('date') || new Date().toISOString().slice(0, 10)
-  const time = c.req.query('time') || '23:59'
-  await runHonestyEngine(DB, date)
+  const { date, time } = await userNow(DB) // server clock; reads never run engines
   const blocks = await blocksForDate(DB, date)
   const overdue = blocks.filter((b: any) => b.end_time <= time && !b.log_status)
   const current = blocks.find((b: any) => b.start_time <= time && time < b.end_time) || null
@@ -1316,7 +1464,7 @@ app.post('/api/agent/intel', async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO intel_entries (log_date, domain, title, situation, my_move, outcome, verdict, principle_used, lesson, people, hermes_analysis)
      VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(b.log_date || new Date().toISOString().slice(0, 10), b.domain, '[HERMES] ' + b.title, b.situation || null,
+  ).bind(b.log_date || (await userNow(c.env.DB)).date, b.domain, '[HERMES] ' + b.title, b.situation || null,
     b.my_move || null, b.outcome || null, b.verdict || 'pending', b.principle_used || null,
     b.lesson || null, b.people || null, b.analysis || null).run()
   return c.json({ ok: true, id: r.meta.last_row_id })
@@ -1325,7 +1473,7 @@ app.post('/api/agent/intel', async (c) => {
 app.post('/api/agent/debrief', async (c) => {
   if (!(await agentAuthed(c))) return c.json({ error: 'Invalid agent token' }, 401)
   const b = await c.req.json()
-  const date = b.date || new Date().toISOString().slice(0, 10)
+  const date = b.date || (await userNow(c.env.DB)).date
   const prev = await c.env.DB.prepare(`SELECT * FROM debriefs WHERE log_date=?`).bind(date).first<any>()
   const merge = (a: string | null | undefined, x: string | null | undefined) =>
     x ? (a ? a + '\n[HERMES] ' + x : '[HERMES] ' + x) : (a ?? null)
@@ -1351,7 +1499,7 @@ app.post('/api/agent/block-log', async (c) => {
   await c.env.DB.prepare(
     `INSERT INTO block_logs (block_id, log_date, status, note, completed_at) VALUES (?,?,?,?,datetime('now'))
      ON CONFLICT(block_id, log_date) DO UPDATE SET status=excluded.status, note=excluded.note, completed_at=excluded.completed_at`
-  ).bind(block_id, date || new Date().toISOString().slice(0, 10), status, note ? '[HERMES] ' + note : null).run()
+  ).bind(block_id, date || (await userNow(c.env.DB)).date, status, note ? '[HERMES] ' + note : null).run()
   return c.json({ ok: true })
 })
 
@@ -1361,7 +1509,7 @@ app.post('/api/agent/message', async (c) => {
   const { content, role } = await c.req.json()
   if (!content) return c.json({ error: 'content required' }, 400)
   await c.env.DB.prepare(`INSERT INTO hermes_messages (role, content, context_date) VALUES (?,?,?)`)
-    .bind(role === 'user' ? 'user' : 'assistant', '[LOCAL-HERMES] ' + content, new Date().toISOString().slice(0, 10)).run()
+    .bind(role === 'user' ? 'user' : 'assistant', '[LOCAL-HERMES] ' + content, (await userNow(c.env.DB)).date).run()
   return c.json({ ok: true })
 })
 
