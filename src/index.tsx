@@ -659,6 +659,7 @@ app.get('/api/predictions/calibration', async (c) => {
 app.post('/api/debrief', async (c) => {
   const DB = c.env.DB
   const b = await c.req.json()
+  b.date = await safeDate(DB, b.date) // clamp: no future debriefs
   const existed = await DB.prepare(`SELECT id FROM debriefs WHERE log_date=?`).bind(b.date).first()
   await DB.prepare(
     `INSERT INTO debriefs (log_date, wins, breaks, tomorrow_targets, strategy_insight, mood, energy, sleep_time, wake_time, sleep_hours)
@@ -672,6 +673,7 @@ app.post('/api/debrief', async (c) => {
     await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type) VALUES (?,?,?,?)`)
       .bind(b.date, 25, 'Night debrief filed. Intelligence report received. (+25)', 'debrief').run()
   }
+  await writeDaySummary(DB, b.date, false)
   return c.json({ ok: true })
 })
 
@@ -1043,17 +1045,25 @@ app.get('/api/rewards', async (c) => {
 app.post('/api/rewards/:id/redeem', async (c) => {
   const DB = c.env.DB
   const id = Number(c.req.param('id'))
-  const { date } = await c.req.json()
+  const { date } = await userNow(DB) // server clock
   const reward = await DB.prepare(`SELECT * FROM rewards WHERE id=?`).bind(id).first<any>()
-  const pts = await DB.prepare(`SELECT COALESCE(SUM(points),0) as total FROM points_ledger`).first<{ total: number }>()
   if (!reward) return c.json({ error: 'no reward' }, 404)
-  if ((pts?.total ?? 0) < reward.cost) {
+  // RACE-SAFE: the debit INSERT itself re-checks the balance atomically —
+  // two simultaneous redeems cannot both pass, because each INSERT only fires
+  // if the CURRENT ledger sum still covers the cost.
+  const debit = await DB.prepare(
+    `INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id)
+     SELECT ?, ?, ?, 'reward', ?
+     WHERE (SELECT COALESCE(SUM(points),0) FROM points_ledger) >= ?`
+  ).bind(date, -reward.cost, `REWARD REDEEMED: ${reward.title} (-${reward.cost})`, id, reward.cost).run()
+  if ((debit.meta as any).changes === 0) {
+    const pts = await DB.prepare(`SELECT COALESCE(SUM(points),0) as total FROM points_ledger`).first<{ total: number }>()
     return c.json({ error: `NOT EARNED YET. You have ${pts?.total ?? 0} pts, this costs ${reward.cost}. Rewards are taken, not given. Back to work.` }, 400)
   }
-  await DB.prepare(`INSERT INTO points_ledger (log_date, points, reason, ref_type, ref_id) VALUES (?,?,?,?,?)`)
-    .bind(date, -reward.cost, `REWARD REDEEMED: ${reward.title} (-${reward.cost})`, 'reward', id).run()
-  await DB.prepare(`UPDATE rewards SET redeemed_count=redeemed_count+1 WHERE id=?`).bind(id).run()
-  await DB.prepare(`INSERT INTO reward_redemptions (reward_id) VALUES (?)`).bind(id).run()
+  await DB.batch([
+    DB.prepare(`UPDATE rewards SET redeemed_count=redeemed_count+1 WHERE id=?`).bind(id),
+    DB.prepare(`INSERT INTO reward_redemptions (reward_id) VALUES (?)`).bind(id),
+  ])
   return c.json({ ok: true })
 })
 

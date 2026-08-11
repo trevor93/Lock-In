@@ -31,6 +31,7 @@ function viewDebrief(){
       '</div>'+
       '<button class="btn btn-gold w-full p-3 text-sm" onclick="saveDebrief()"><i class="fas fa-file-shield mr-1"></i> FILE INTELLIGENCE REPORT (+25)</button>'+
     '</div>'+
+    predictionsPanel()+
     rewardsPanel()+
     '<div class="sect">PAST REPORTS — '+DEBRIEFS.length+' FILED</div>'+
     DEBRIEFS.slice(0,14).map(x=>
@@ -59,7 +60,7 @@ function rewardsPanel(){
 }
 
 async function redeem(id){
-  await api('post','/api/rewards/'+id+'/redeem',{date:todayStr()});
+  await api('post','/api/rewards/'+id+'/redeem',{}); // date is server-derived
   FX.confetti({count:80}); FX.toast('REWARD CLAIMED — paid in discipline, enjoy with zero guilt','gold');
   REWARDS=(await axios.get('/api/rewards')).data; await loadState(); render();
 }
@@ -71,9 +72,76 @@ async function saveDebrief(){
   if(!b.wins&&!b.breaks&&!b.tomorrow_targets){ toast('An empty report is a lie of omission. Write something true.',true); return; }
   if(!b.tomorrow_targets){ toast('Law 4: tomorrow\'s 3 targets are NOT optional. Decide tonight.',true); return; }
   await api('post','/api/debrief',b);
+  if (window.clearDrafts) clearDrafts(['db-wins','db-breaks','db-targets','db-insight','db-mood','db-energy','db-wake','db-sleep','db-hours']);
   FX.success(); FX.toast('INTELLIGENCE REPORT FILED — tomorrow already knows its orders  +25','gold');
   DEBRIEFS=(await axios.get('/api/debriefs')).data; await loadState(); render();
 }
+
+/* ============ PREDICTION LOG — the calibration instrument ============ */
+let PREDICTIONS=null, CALIBRATION=null;
+async function loadPredictions(){
+  [PREDICTIONS, CALIBRATION] = await Promise.all([
+    axios.get('/api/predictions').then(r=>r.data),
+    axios.get('/api/predictions/calibration').then(r=>r.data)
+  ]);
+}
+function predictionsPanel(){
+  if(!PREDICTIONS){ loadPredictions().then(()=>{ if(TAB==='debrief')render(); }); return '<div class="card p-3 mb-3 text-[11px] text-gray-500">Loading prediction log…</div>'; }
+  const open = PREDICTIONS.filter(p=>p.outcome==='unresolved');
+  const overdue = open.filter(p=>p.resolve_by<=STATE.date);
+  const resolved = PREDICTIONS.filter(p=>p.outcome==='right'||p.outcome==='wrong');
+  const cal = CALIBRATION||{};
+  return '<div class="card-lux p-3.5 mb-3" id="prediction-log">'+
+    '<h3 class="font-engraved font-bold text-xs gold-text mb-1"><i class="fas fa-crosshairs mr-1"></i>PREDICTION LOG — CALIBRATED JUDGMENT</h3>'+
+    '<p class="text-[10px] text-gray-500 mb-2">Claim → confidence → date → graded. The only cure for a brain that rewrites its own past.</p>'+
+    (cal.n?'<div class="card-glass p-2.5 mb-2">'+
+      '<p class="text-[10px] text-gray-400">'+cal.n+' graded · Brier <b class="text-gold">'+cal.brier+'</b> (0 = prophet, 0.25 = coin flip)</p>'+
+      (cal.buckets&&cal.buckets.length?'<div class="flex items-end gap-1 mt-1.5" style="height:44px">'+
+        cal.buckets.map(b=>'<div class="flex-1 text-center">'+
+          '<div class="flex items-end justify-center gap-0.5" style="height:32px">'+
+            '<div style="width:8px;height:'+(b.avgConfidence*0.32)+'px;background:#5b6b85" title="claimed"></div>'+
+            '<div style="width:8px;height:'+(b.hitRate*0.32)+'px;background:'+(b.hitRate>=b.avgConfidence-5?'#22c55e':'#dc2626')+'" title="actual"></div>'+
+          '</div><span class="text-[7px] text-gray-600">'+b.range+'</span></div>').join('')+
+      '</div><p class="text-[7px] text-gray-600 mt-0.5">grey = claimed · green/red = reality</p>':'')+
+      '<p class="text-[10px] mt-1.5 leading-relaxed '+((cal.verdict||'').startsWith('OVERCONF')?'text-red-400':(cal.verdict||'').startsWith('WELL')?'text-jade':'text-amber-400')+'">'+esc(cal.verdict||'')+'</p>'+
+    '</div>':'<p class="text-[10px] text-gray-500 mb-2">'+esc(cal.verdict||'No graded predictions yet.')+'</p>')+
+    (overdue.length?'<div class="card p-2.5 mb-2 border-red-800/50"><p class="text-[10px] font-bold text-red-400 mb-1">'+overdue.length+' PREDICTION'+(overdue.length>1?'S':'')+' AWAITING JUDGMENT — grade them now, memory rots fast:</p>'+
+      overdue.map(p=>predRow(p)).join('')+'</div>':'')+
+    (open.filter(p=>p.resolve_by>STATE.date).length?'<div class="mb-2">'+open.filter(p=>p.resolve_by>STATE.date).slice(0,5).map(p=>predRow(p)).join('')+'</div>':'')+
+    '<div class="card p-2.5 mb-2">'+
+      '<input id="pred-claim" type="text" placeholder="Precise, falsifiable claim — e.g. “X will reply within 3 days”" class="w-full bg-ink border border-line rounded px-2 py-2 text-[11px] mb-1.5">'+
+      '<div class="grid grid-cols-3 gap-1.5 mb-1.5">'+
+        '<div><label class="text-[8px] font-bold text-gray-500">CONFIDENCE %</label><input id="pred-conf" type="number" min="50" max="99" value="70" class="w-full"></div>'+
+        '<div><label class="text-[8px] font-bold text-gray-500">RESOLVE BY</label><input id="pred-by" type="date" class="w-full"></div>'+
+        '<div><label class="text-[8px] font-bold text-gray-500">DOMAIN</label><input id="pred-domain" type="text" placeholder="people/money/…" class="w-full"></div>'+
+      '</div>'+
+      '<button class="btn w-full p-2 text-[11px] bg-gold/10 border border-gold/40 text-gold font-bold" onclick="savePrediction()"><i class="fas fa-stamp mr-1"></i>SEAL THE CLAIM</button>'+
+    '</div>'+
+    (resolved.length?'<details class="text-[10px] text-gray-500"><summary class="cursor-pointer font-bold">GRADED RECORD ('+resolved.length+')</summary>'+
+      resolved.slice(0,15).map(p=>'<div class="py-1 border-b border-line/40"><span class="'+(p.outcome==='right'?'text-jade':'text-red-400')+' font-bold">'+p.outcome.toUpperCase()+'</span> · '+p.confidence+'% · '+esc(p.claim)+'</div>').join('')+'</details>':'')+
+  '</div>';
+}
+function predRow(p){
+  return '<div class="flex items-center gap-1.5 py-1 border-b border-line/40 last:border-0">'+
+    '<div class="flex-1 min-w-0"><p class="text-[10px] text-gray-300 truncate">'+esc(p.claim)+'</p>'+
+    '<p class="text-[8px] text-gray-600">'+p.confidence+'% · by '+p.resolve_by+(p.domain?' · '+esc(p.domain):'')+'</p></div>'+
+    '<button class="btn px-2 py-1 text-[9px] bg-emerald-900/60 border border-emerald-700 text-emerald-300" onclick="resolvePred('+p.id+',\'right\')">RIGHT</button>'+
+    '<button class="btn px-2 py-1 text-[9px] bg-red-900/60 border border-red-800 text-red-300" onclick="resolvePred('+p.id+',\'wrong\')">WRONG</button>'+
+    '<button class="btn px-1.5 py-1 text-[9px] bg-gray-800/60 border border-line text-gray-500" title="void (unfalsifiable/canceled)" onclick="resolvePred('+p.id+',\'void\')">—</button>'+
+  '</div>';
+}
+async function savePrediction(){
+  const claim=$('#pred-claim').value, confidence=Number($('#pred-conf').value), resolve_by=$('#pred-by').value, domain=$('#pred-domain').value;
+  await api('post','/api/predictions',{claim,confidence,resolve_by,domain});
+  if (window.clearDrafts) clearDrafts(['pred-claim','pred-conf','pred-by','pred-domain']);
+  FX.success(); FX.toast('CLAIM SEALED — reality will grade it on '+resolve_by,'gold');
+  await loadPredictions(); render();
+}
+async function resolvePred(id,outcome){
+  await api('post','/api/predictions/'+id+'/resolve',{outcome});
+  FX.tap(); await loadPredictions(); render();
+}
+window.savePrediction=savePrediction; window.resolvePred=resolvePred;
 
 /* ============ STATS ============ */
 function viewStats(){
@@ -121,10 +189,10 @@ function viewStats(){
       '</div>'+
     '</div>':'')+
     '<div class="card p-3 mb-3">'+
-      '<h3 class="text-[10px] font-bold tracking-widest text-gray-400 mb-2">LAST 14 DAYS (green = victory day: ≥80% + debrief)</h3>'+
+      '<h3 class="text-[10px] font-bold tracking-widest text-gray-400 mb-2">LAST 14 DAYS (green = victory · blue = held the line)</h3>'+
       '<div class="flex items-end gap-1" style="height:70px">'+
         s.days.map(d=>'<div class="flex-1 flex flex-col items-center gap-0.5">'+
-          '<div class="w-full rounded-t" style="height:'+Math.max(d.pct,3)*0.6+'px;background:'+(d.pct>=80&&d.debrief?'#22c55e':d.pct>=50?'#f59e0b':d.total===0?'#1e2a3d':'#dc2626')+'"></div>'+
+          '<div class="w-full rounded-t" style="height:'+Math.max(d.pct,3)*0.6+'px;background:'+(d.pct>=80&&d.debrief?'#22c55e':d.mvdHeld?'#3b82f6':d.pct>=50?'#f59e0b':d.total===0?'#1e2a3d':'#dc2626')+'"></div>'+
           '<span class="text-[7px] text-gray-600">'+d.date.slice(8)+'</span></div>').join('')+
       '</div>'+
     '</div>'+

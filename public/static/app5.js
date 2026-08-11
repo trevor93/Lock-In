@@ -20,7 +20,10 @@ const Alarm = {
     if ('Notification' in window && Notification.permission === 'default') {
       setTimeout(() => Notification.requestPermission(), 3000);
     }
-    setInterval(() => this.tick(), 15000);
+    // 60s cadence (review P2: was 15s = 5,760 engine runs/day). Block-start
+    // alarms still land inside their minute; state refresh rides the same tick.
+    setInterval(() => this.tick(), 60000);
+    setTimeout(() => this.tick(), 4000); // one early tick after load
   },
 
   /* LUXURY GRAND CHIME — concert-hall bell synthesis.
@@ -98,7 +101,7 @@ const Alarm = {
     const today = todayStr();
     for (const b of (STATE.blocks || [])) {
       const key = today + '-' + b.id;
-      // fire at block start (within the 15s tick window we compare minute strings)
+      // fire at block start (60s tick — minute strings match exactly once)
       if (b.start_time === t && !this.fired[key]) {
         this.fired[key] = 1;
         sessionStorage.setItem('wr_fired', JSON.stringify(this.fired));

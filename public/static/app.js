@@ -25,16 +25,55 @@ async function api(method, url, data) {
     const r = await axios({ method, url, data });
     return r.data;
   } catch (e) {
+    if (e?.response?.status === 401 && e?.response?.data?.error === 'AUTH REQUIRED') { renderLogin(); throw e; }
     const msg = e?.response?.data?.error || 'Request failed';
     toast(msg, true);
     throw e;
   }
 }
 
+/* ============ AUTH GATE ============ */
+function renderLogin(isSetup) {
+  FX.killSplash && FX.killSplash();
+  app().innerHTML = `
+  <main class="max-w-lg mx-auto px-4 min-h-screen flex flex-col justify-center" id="login-screen">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">⚔</div>
+      <h1 class="font-engraved gold-text text-2xl font-bold">WAR ROOM</h1>
+      <p class="text-[10px] tracking-[.3em] text-gray-500 font-semibold mt-1">${isSetup?'SET THE GATE PASSWORD':'IDENTIFY YOURSELF'}</p>
+    </div>
+    <div class="card-lux p-5">
+      <input id="login-pass" type="password" placeholder="${isSetup?'New password (min 8 chars)':'Password'}" autocomplete="${isSetup?'new-password':'current-password'}"
+        class="w-full bg-ink border border-line rounded-lg px-3 py-3 text-sm mb-3" onkeydown="if(event.key==='Enter')doLogin(${isSetup?'true':'false'})">
+      <button class="btn w-full p-3 bg-gold/15 border border-gold/50 text-gold font-bold text-sm" onclick="doLogin(${isSetup?'true':'false'})">
+        <i class="fas fa-key mr-1"></i>${isSetup?'SEAL THE GATE':'ENTER'}
+      </button>
+      <p class="text-[10px] text-gray-600 mt-3 text-center">${isSetup?'This password protects everything — the whole command post sits behind it. There is no recovery. Write it somewhere real.':'The war room admits its commander only.'}</p>
+    </div>
+  </main>`;
+  setTimeout(()=>{ const el=$('#login-pass'); if(el) el.focus(); }, 50);
+}
+async function doLogin(isSetup) {
+  const pass = $('#login-pass').value;
+  try {
+    await axios.post(isSetup?'/api/auth/setup':'/api/auth/login', { password: pass });
+    FX.success && FX.success();
+    await loadState(); render();
+  } catch (e) {
+    toast(e?.response?.data?.error || 'Login failed', true);
+  }
+}
+window.doLogin = doLogin;
+
 function toast(msg, bad=false) { FX.toast(msg, bad?'bad':'ok'); }
 
+// POST /api/tick = the ONLY engine crank. Server derives date/time from the
+// stored timezone — the client clock is advisory (sent once to set the tz).
+let TZ_SENT = false;
 async function loadState() {
-  STATE = (await axios.get(`/api/state?date=${todayStr()}&time=${nowTime()}`)).data;
+  const body = TZ_SENT ? {} : { tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || null) };
+  STATE = (await axios.post('/api/tick', body)).data;
+  TZ_SENT = true;
 }
 
 function tabBadge(id) {
@@ -125,8 +164,11 @@ async function ackFlag(id){ await api('post',`/api/flags/${id}/ack`); await load
 function statusBtns(b, compact=false) {
   const st = b.log_status;
   if (st === 'missed') {
+    const canAppeal = STATE && STATE.appealAvailable;
     return `<span class="pill" style="background:rgba(153,27,27,.25);color:#f87171;border:1px solid rgba(220,38,38,.45);letter-spacing:.12em">
-      <i class="fas fa-ban text-[9px]"></i>CANCELED</span>`;
+      <i class="fas fa-ban text-[9px]"></i>CANCELED</span>${canAppeal?`
+    <button class="btn px-2 py-1 text-[9px] bg-gray-800/60 border border-gold/40 text-gold ml-1" title="Use this week's appeal token"
+      onclick="appealBlock(${b.id},'${STATE.date}','${esc(b.title).replace(/'/g,'&#39;')}')"><i class="fas fa-gavel"></i></button>`:''}`;
   }
   const mk = (val, ic, cls, active) => `
     <button class="btn ${compact?'px-2.5 py-1.5 text-[11px]':'px-3 py-2 text-xs'} ${active?cls:'bg-gray-800/60 text-gray-500 border border-line'}"
@@ -141,7 +183,7 @@ async function logBlock(id, status, ev){
   const el = ev && ev.target ? ev.target.closest('button') : null;
   const b = (STATE.blocks||[]).find(x=>x.id===id);
   try {
-    await api('post',`/api/blocks/${id}/log`,{date:todayStr(),status});
+    await api('post',`/api/blocks/${id}/log`,{status}); // date is server-derived
   } catch(e) {
     FX.fail(); await loadState(); render(); return; // 409 WINDOW CLOSED — api() already toasted
   }
@@ -197,13 +239,37 @@ function viewNow() {
     <div class="card-lux p-4 mb-3 flex items-center gap-4">
       ${FX.ring(adh.pct, 84, 7, adh.pct+'%', 'LAW 6')}
       <div class="flex-1">
-        <h3 class="text-[10px] font-bold tracking-[.18em] text-gray-400 mb-1">TODAY'S ADHERENCE</h3>
-        <p class="text-xs text-gray-300"><span class="font-disp font-bold text-white">${adh.done}</span> / ${adh.total} blocks held</p>
-        <p class="text-[10px] text-gray-500 mt-1">Target: 80% · today's points
+        <h3 class="text-[10px] font-bold tracking-[.18em] text-gray-400 mb-1">WEIGHTED ADHERENCE</h3>
+        <p class="text-xs text-gray-300"><span class="font-disp font-bold text-white">${adh.done}</span> / ${adh.total} scored blocks · <span class="text-gray-500">${Math.round(adh.wScore*10)/10}/${adh.wTotal} wt</span></p>
+        <p class="text-[10px] text-gray-500 mt-1">Horizon: 80% · today's points
           <span class="font-disp font-bold ${s.todayPoints>=0?'text-jade':'text-red-400'}">${s.todayPoints>=0?'+':''}${s.todayPoints}</span></p>
+        ${s.median!==null&&s.median!==undefined?`<p class="text-[10px] mt-0.5 ${s.delta>=0?'text-jade':'text-amber-400'}">vs your 14-day median (${s.median}%): <b>${s.delta>=0?'+':''}${s.delta}</b> — ${s.delta>=0?'ahead of your own baseline':'below your own baseline'}</p>`:''}
         <div class="prog mt-2"><div style="width:${adh.pct}%"></div></div>
       </div>
     </div>
+
+    ${adh.mvdTotal>0?`
+    <div class="card p-3 mb-3 ${adh.mvdHeld?'border-jade/40':''}" id="mvd-panel">
+      <div class="flex items-center gap-2">
+        <i class="fas fa-shield-halved ${adh.mvdHeld?'text-jade':'text-gray-500'}"></i>
+        <div class="flex-1">
+          <p class="text-[10px] font-bold tracking-widest ${adh.mvdHeld?'text-jade':'text-gray-400'}">${adh.mvdHeld?'✓ HELD THE LINE':'MINIMUM VIABLE DAY'}</p>
+          <p class="text-[10px] text-gray-500">${adh.mvdDone}/${adh.mvdTotal} core blocks — ${adh.mvdHeld?'the streak survives no matter what else happens today.':'hit all of these and the day cannot collapse.'}</p>
+        </div>
+        <span class="font-disp font-bold ${adh.mvdHeld?'text-jade':'text-gray-400'}">${adh.mvdDone}/${adh.mvdTotal}</span>
+      </div>
+    </div>`:''}
+
+    ${(s.loadReductions&&s.loadReductions.length)?s.loadReductions.map(lr=>`
+    <div class="card p-3 mb-3 border-amber-700/40" id="load-reduction-${lr.id}">
+      <p class="text-[10px] font-bold tracking-widest text-amber-400 mb-1"><i class="fas fa-compress"></i> LOAD REDUCTION · “${esc(lr.title)}” · half duration until ${lr.end_date}</p>
+      ${lr.reason?`<p class="text-[10px] text-gray-500">Cause on record: ${esc(lr.reason.replace(/_/g,' '))}</p>`:`
+      <p class="text-[10px] text-gray-400 mb-1.5">Two misses in a row — the plan was wrong somewhere. Why?</p>
+      <div class="flex flex-wrap gap-1.5">
+        ${[['wrong_time','WRONG TIME'],['too_long','TOO LONG'],['wrong_prereq','WRONG PREREQ'],['dont_want_it','DON’T WANT IT']].map(([v,l])=>`
+        <button class="btn px-2 py-1.5 text-[10px] bg-gray-800/60 border border-line text-gray-300" onclick="answerLR(${lr.id},'${v}')">${l}</button>`).join('')}
+      </div>`}
+    </div>`).join(''):''}
 
     ${s.activeUnits.length?`
     <div class="card p-3 mb-3">
@@ -287,7 +353,22 @@ async function checkLaw(id, kept){
   await loadLaws();
 }
 
+async function answerLR(id, reason){
+  const r = await api('post',`/api/load-reductions/${id}/answer`,{reason});
+  if (r.advice) FX.toast(r.advice, 'gold');
+  await loadState(); render();
+}
+async function appealBlock(blockId, blockDate, title){
+  const reason = prompt('APPEAL — “'+title+'” ('+blockDate+')\n\nOne token per week. The reason goes on the PERMANENT record and must be at least 100 characters. What actually happened?');
+  if (reason===null) return;
+  try {
+    const r = await api('post','/api/appeals',{block_id:blockId, block_date:blockDate, reason});
+    FX.success(); FX.toast('WINDOW REOPENED — '+(r.refunded||0)+' pts refunded. Now win it.', 'gold');
+    await loadState(); render();
+  } catch(_){}
+}
 window.ackFlag=ackFlag; window.logBlock=logBlock; window.loadLaws=loadLaws; window.checkLaw=checkLaw;
+window.answerLR=answerLR; window.appealBlock=appealBlock;
 
 /* render dispatcher — extended by app2.js */
 function render() {
@@ -310,8 +391,36 @@ setInterval(()=>{
 }, 1000);
 
 (async function init(){
-  try { await loadState(); render(); }
+  try {
+    const st = (await axios.get('/api/auth/status')).data;
+    if (!st.setup) { renderLogin(true); FX.killSplash(); return; }
+    if (!st.authed) { renderLogin(false); FX.killSplash(); return; }
+    await loadState(); render();
+  }
   catch(e){ app().innerHTML = `<div class="p-6 text-center text-red-400 text-sm">Failed to load the war room. Pull to refresh.<br>${esc(e.message||'')}</div>`; }
   finally { FX.killSplash(); }
-  setInterval(async ()=>{ if(TAB==='now'||TAB==='today'){ try{ await loadState(); render(); }catch(_){} } }, 60000);
+  setInterval(async ()=>{ if(STATE && (TAB==='now'||TAB==='today')){ try{ await loadState(); render(); }catch(_){} } }, 60000);
 })();
+
+/* ============ NEVER LOSE A WORD — textarea/input persistence ============ */
+/* Every textarea and text input with an id is mirrored to localStorage on input,
+   restored on render, and cleared when its form successfully submits. */
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  if (!t || !t.id) return;
+  if (t.tagName === 'TEXTAREA' || (t.tagName === 'INPUT' && (t.type === 'text' || t.type === 'time' || t.type === 'number' || t.type === 'date'))) {
+    try { localStorage.setItem('wr_draft_' + t.id, t.value); } catch(_) {}
+  }
+});
+function restoreDrafts(root) {
+  (root || document).querySelectorAll('textarea[id], input[id]').forEach(el => {
+    if (el.value) return; // server-filled value wins
+    const v = localStorage.getItem('wr_draft_' + el.id);
+    if (v !== null && v !== '') el.value = v;
+  });
+}
+function clearDrafts(ids) { ids.forEach(id => localStorage.removeItem('wr_draft_' + id)); }
+window.restoreDrafts = restoreDrafts; window.clearDrafts = clearDrafts;
+/* auto-restore after each render */
+const _origShell = shell;
+shell = function(content) { _origShell(content); setTimeout(()=>restoreDrafts(), 0); };
